@@ -38,6 +38,23 @@ There's also a tiny example CLI:
 cargo run --release --example crabz2 -- file.bz2 > file
 ```
 
+### Real-world example: CourtListener bulk data
+
+[`examples/courtlistener.rs`](examples/courtlistener.rs) streams a bzip2-compressed
+[CourtListener](https://www.courtlistener.com/help/api/bulk-data/) bulk CSV download
+straight through the decoder — the pure-Rust, in-process replacement for an
+`lbzip2 -dc file.bz2 | …` shell-out. The HTTP body flows directly into `crabz2::reader`,
+so nothing is fully buffered no matter how large the file:
+
+```sh
+cargo run --release --example courtlistener            # small `courts` table (~80 KB)
+cargo run --release --example courtlistener -- citations
+cargo run --release --example courtlistener -- bulk-data/opinions-2026-06-30.csv.bz2
+```
+
+It downloads with a pure-Rust HTTPS client (`ureq` + rustls, a dev-dependency only — it
+is **not** in the dependency graph for anyone who depends on `crabz2`).
+
 ## Correctness
 
 `crabz2` streams one block at a time (peak memory ≈ one decompressed block), handles

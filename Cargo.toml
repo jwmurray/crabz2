@@ -13,6 +13,11 @@ categories = ["compression"]
 
 [dependencies]
 
+# Only used by the `courtlistener` example (a pure-Rust HTTPS client, rustls/no C).
+# Dev-dependencies are NOT part of the published dependency graph for consumers.
+[dev-dependencies]
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
 [features]
 default = []
 # Reserved for a rayon-backed parallel block decoder. Not yet implemented.
