@@ -1,0 +1,20 @@
+[package]
+name = "crabz2"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.63"
+license = "MIT OR Apache-2.0"
+description = "Pure-Rust bzip2 decompression, with a parallel decoder on the roadmap. No C, no libbz2."
+repository = "https://github.com/jwmurray/crabz2"
+homepage = "https://github.com/jwmurray/crabz2"
+readme = "README.md"
+keywords = ["bzip2", "bz2", "decompression", "parallel"]
+categories = ["compression"]
+
+[dependencies]
+bzip2-rs = "0.1"
+
+[features]
+default = []
+# Reserved for the rayon-backed parallel block decoder (crabz2 0.2+). Not yet implemented.
+parallel = []
