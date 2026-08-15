@@ -442,8 +442,17 @@ impl<R: Read> Crabz2Reader<R> {
 
             if sym <= 1 {
                 // RUNA (0) / RUNB (1): bijective base-2 zero-run length.
+                //
+                // Both the run and the bit position are attacker-controlled: a
+                // stream can emit RUNA forever, so the accumulator has to be
+                // bounded here rather than at the flush below. No legal run can
+                // exceed the declared block size, and stopping there also keeps
+                // the shift well inside `u64`.
                 run += ((sym as u64) + 1) << run_bit;
                 run_bit += 1;
+                if run_bit >= 32 || run > self.block_size as u64 {
+                    return bad("bzip2 zero-run exceeds declared block size");
+                }
                 continue;
             }
 
@@ -607,5 +616,109 @@ mod tests {
         let n = bad.len();
         bad[n - 6] ^= 0x01; // flip a bit in the payload
         assert!(decompress(&bad).is_err());
+    }
+
+    /// MSB-first bit writer, used to synthesize hostile streams for the tests below.
+    struct BitWriter {
+        out: Vec<u8>,
+        acc: u32,
+        nbits: u32,
+    }
+
+    impl BitWriter {
+        fn new() -> Self {
+            BitWriter {
+                out: Vec::new(),
+                acc: 0,
+                nbits: 0,
+            }
+        }
+
+        fn put(&mut self, val: u32, n: u32) {
+            for i in (0..n).rev() {
+                self.acc = (self.acc << 1) | ((val >> i) & 1);
+                self.nbits += 1;
+                if self.nbits == 8 {
+                    self.out.push(self.acc as u8);
+                    self.acc = 0;
+                    self.nbits = 0;
+                }
+            }
+        }
+
+        fn finish(mut self) -> Vec<u8> {
+            if self.nbits > 0 {
+                let pad = 8 - self.nbits;
+                self.acc <<= pad;
+                self.out.push(self.acc as u8);
+            }
+            self.out
+        }
+    }
+
+    /// Build a single-block stream whose RLE2 section is nothing but `n_runs`
+    /// consecutive RUNA symbols — a zero-run declaration with no terminating
+    /// literal. Every symbol in the block alphabet is given a 2-bit code, so
+    /// RUNA is `00`, RUNB is `01`, EOB is `10`.
+    fn runa_flood(n_runs: usize) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.put(u32::from(b'B'), 8);
+        w.put(u32::from(b'Z'), 8);
+        w.put(u32::from(b'h'), 8);
+        w.put(u32::from(b'9'), 8);
+
+        w.put(0x3141_59, 24); // block magic, high half
+        w.put(0x26_5359, 24); // block magic, low half
+        w.put(0, 32); // block CRC (never reached)
+        w.put(0, 1); // not randomized
+        w.put(0, 24); // orig_ptr
+
+        // Symbol map: byte 0x00 only, so n_in_use = 1 and alpha_size = 3.
+        w.put(0x8000, 16); // group 0 present
+        w.put(0x8000, 16); // within group 0, byte 0
+
+        w.put(2, 3); // n_groups
+        w.put(2, 15); // n_selectors (2 * 50 symbols of headroom)
+        w.put(0, 1); // selector 0
+        w.put(0, 1); // selector 0
+
+        // Both groups: every one of the 3 symbols gets code length 2.
+        for _ in 0..2 {
+            w.put(2, 5); // starting length
+            for _ in 0..3 {
+                w.put(0, 1); // no delta, take the current length
+            }
+        }
+
+        for _ in 0..n_runs {
+            w.put(0b00, 2); // RUNA
+        }
+        w.finish()
+    }
+
+    /// A stream that declares a zero-run longer than any legal block must be
+    /// rejected as data corruption. Before this was bounded, the bijective
+    /// base-2 run accumulator shifted by an attacker-controlled bit count and
+    /// panicked (shift overflow) once the run passed 64 RUNA/RUNB symbols.
+    #[test]
+    fn rejects_absurd_run_length() {
+        for n_runs in [40, 64, 65, 128, 400] {
+            let err = decompress(&runa_flood(n_runs));
+            assert!(
+                err.is_err(),
+                "a {n_runs}-symbol zero-run should be rejected, not decoded"
+            );
+        }
+    }
+
+    /// The declared block size bounds the decoded block: no crafted header or
+    /// run length may make the decoder buffer more than the level allows.
+    #[test]
+    fn run_length_cannot_exceed_declared_block_size() {
+        // Level 1 declares a 100 KB block; a run claiming far more than that
+        // must fail before anything is buffered.
+        let mut stream = runa_flood(64);
+        stream[3] = b'1';
+        assert!(decompress(&stream).is_err());
     }
 }

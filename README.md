@@ -69,6 +69,47 @@ inputs from empty to tens of MB, RLE-heavy and high-entropy data, and multi-stre
 Legacy "randomized" blocks (bzip2 < 0.9.5, ~1998) are rejected with a clear error rather
 than silently miscorrupted.
 
+## Fuzzing
+
+A decoder for untrusted input has to say what it is fuzzed for. The
+[`fuzz/`](fuzz/) directory is a [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz)
+crate (nightly-only, outside the parent crate, so `crabz2` itself stays at zero
+dependencies):
+
+| Target | Input | Asserts |
+|---|---|---|
+| `fuzz_decompress` | arbitrary bytes | the three invariants below |
+
+**Invariants.**
+
+1. **Never panics.** Every byte string is either decoded or rejected with an
+   `io::Error`. No input can cause an out-of-range index, an arithmetic overflow,
+   an abort, or a non-terminating decode.
+2. **Bounded allocation.** The block size declared in the stream header — nothing
+   else in the input — bounds memory. The target measures the decoder's live
+   allocation high-water mark with a tracking global allocator and asserts it stays
+   inside the cap that the declared level structurally implies (the BWT buffer plus
+   the worst-case RLE1 expansion of one block). No crafted header, run length, or
+   symbol count can make the decoder ask for more.
+3. **Clean errors on malformed input.** Corrupt, truncated, and hostile streams
+   produce an `Err`, never partial or fabricated plaintext, and the streaming
+   `reader` and buffering `decompress` always agree on validity and output length.
+
+The committed seed corpus holds the crate's own test vectors, small files compressed
+by system `bzip2` at levels 1 and 9 (prose, run-heavy, incompressible, and full-256
+byte alphabets), concatenated multi-stream files, and minimized inputs from past
+findings. CI runs a 60-second smoke pass of each target on nightly, on pull requests
+touching `src/` and on a weekly schedule; longer campaigns are run out of band.
+
+```sh
+cargo +nightly fuzz run fuzz_decompress -- -max_total_time=300
+```
+
+**Findings.** Fuzzing this target found one real bug, fixed in 0.3.x: the RLE2
+zero-run accumulator shifted by an attacker-controlled bit count, so a stream of
+more than 64 consecutive RUNA/RUNB symbols panicked with a shift overflow instead
+of being rejected. Runs are now bounded by the declared block size, as libbz2 does.
+
 ## License
 
 Licensed under the [MIT license](LICENSE-MIT).

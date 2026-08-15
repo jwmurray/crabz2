@@ -70,7 +70,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bytes += n as u64;
         rows += 1;
         if preview.len() < 3 {
-            let s: String = String::from_utf8_lossy(&line).trim_end().chars().take(160).collect();
+            let s: String = String::from_utf8_lossy(&line)
+                .trim_end()
+                .chars()
+                .take(160)
+                .collect();
             preview.push(s);
         }
     }

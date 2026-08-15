@@ -1,0 +1,25 @@
+[package]
+name = "crabz2-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace root: the fuzz crate is nightly-only and pulls in
+# dependencies, so it must stay outside the zero-dependency parent crate.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.crabz2]
+path = ".."
+
+[[bin]]
+name = "fuzz_decompress"
+path = "fuzz_targets/fuzz_decompress.rs"
+test = false
+doc = false
+bench = false
