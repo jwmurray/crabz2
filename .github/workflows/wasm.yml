@@ -1,0 +1,64 @@
+name: wasm
+
+# The npm package is built from the same source as the crate, so a change to the
+# decoder can break it without breaking anything `ci.yml` checks. This workflow
+# builds the package with wasm-pack and runs the real artifact under node.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wasm-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: wasm-pack build + node smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: rustup toolchain install stable --profile minimal --component clippy
+      - run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache wasm-pack and its downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/wasm-pack
+            ~/.cache/.wasm-pack
+          key: wasm-pack-${{ runner.os }}-v1
+
+      - name: Install wasm-pack
+        run: command -v wasm-pack || cargo install wasm-pack --locked
+
+      # The wrapper's logic is plain Rust behind the bindings, so it is testable on
+      # the host — no browser, no wasm runtime.
+      - name: Unit tests
+        run: cargo test -p crabz2-wasm
+
+      - name: Clippy
+        run: cargo clippy -p crabz2-wasm --all-targets -- -D warnings
+
+      - name: Build the npm package (web)
+        run: crabz2-wasm/build.sh web pkg
+
+      # Builds for node and pushes multi-megabyte `bzip2` output through the built
+      # module: both exports, several chunk sizes, corruption, truncation, and the
+      # bound on how much the streaming decoder holds.
+      - name: Smoke test the built package
+        run: crabz2-wasm/tests/node/run.sh
+
+      - name: Check the package is publishable
+        working-directory: crabz2-wasm/pkg
+        run: npm pack --dry-run

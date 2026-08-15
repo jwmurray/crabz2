@@ -11,7 +11,7 @@ others sit on.
 | 3 | (M) Fuzzing (`cargo-fuzz`) | 0.3.x | — |
 | 4 | (M) Benchmarks vs libbz2, numbers in README | **shipped** (`main`) | — |
 | 5 | (M) Parallel block decode (`parallel` feature) | 0.4 | 1 |
-| 6 | (M) WASM wrapper crate + npm package | 0.4 | 1, 2 |
+| 6 | (M) WASM wrapper crate + npm package | **built** (`main`), npm at 0.4 | 1, 2 |
 | 7 | (M) Encoder — pure-Rust bzip2 compression | **shipped** (`main`) | 1 (conventions only) |
 | 8 | Announcement (r/rust, TWiR) | after 0.4 | 4, 5, 6 |
 
@@ -111,20 +111,44 @@ the crate's clearest differentiator.
 **Why.** Item 1 makes the core wasm-clean (0.2.1 already compiles for
 `wasm32-unknown-unknown` untouched); this makes it *usable* from JS.
 
+**Status: implemented on `main`.** Not yet published to npm — that waits on the
+0.4 release and the owner's npm credentials. `crabz2-wasm/README.md` is the
+package's own documentation; what follows is the design and where it landed.
+
 **Design.**
-- Workspace restructure: root becomes a virtual workspace; the core crate
-  stays exactly as published (`crabz2`, zero deps); new `crates/crabz2-wasm`
-  (not published to crates.io; published to **npm** as `crabz2` via
-  wasm-pack).
+- Workspace: the core crate stays exactly as published (`crabz2`, zero deps)
+  and is *itself* the workspace root — `[workspace] members = [".",
+  "crabz2-wasm"]` — rather than the virtual workspace originally sketched
+  here. A virtual workspace would have moved `src/`, which is not worth
+  breaking every in-flight branch and every link into the repository for.
+  Nothing about how the crate builds, packages, or resolves changes.
+  `crabz2-wasm/` sits beside it: `publish = false`, published to **npm** as
+  `crabz2` via wasm-pack (the Rust package cannot take that name while it
+  shares a workspace with the library, so `crabz2-wasm/build.sh` corrects the
+  name in the generated `package.json`).
 - Exports: `decompress(input: Uint8Array) -> Uint8Array` for the common case,
   and a push-based streaming class for large files —
   `Bz2Decoder { push(chunk: Uint8Array): Uint8Array; finish(): Uint8Array }`
   — driving the sans-io state machine from item 1, so memory stays ~one block
   regardless of file size.
-- Demo page under `crates/crabz2-wasm/www/`: drop a `.bz2`, get the file —
-  decompressed client-side; doubles as the announcement artifact.
-- CI: `wasm-pack build` + headless browser smoke test (the two exports round
-  a fixture).
+- The state machine restarts rather than resumes a partially-read block, so
+  the wrapper must not re-attempt a decode on every `push`; that would be
+  quadratic in the block size. It buffers instead, and re-attempts only when
+  enough new input has arrived to pay for the attempt — the size of the
+  previous block, which is a tight estimate within one file, growing
+  geometrically when that estimate falls short. The core's contract is
+  untouched; item 1's `BlockDecoder` only gained the two accessors
+  (`consumed`, `rebase`) a push-based caller needs to drop committed bytes,
+  which the `io::Read` adapter was already doing through the private field.
+- Demo page under `crabz2-wasm/www/`: drop a `.bz2`, get the file —
+  decompressed client-side, with progress and the decoder's live buffer
+  shown; doubles as the announcement artifact.
+- CI (`wasm.yml`, separate from `ci.yml`): `wasm-pack build`, then a node
+  smoke test of the built package — both exports against multi-megabyte
+  `bzip2` output at levels 1 and 9, several chunk sizes, corruption,
+  truncation, and an assertion that streaming memory stays bounded by the
+  block rather than the file. A browser harness would test the same two
+  functions through more moving parts.
 
 ## 7. Encoder (the big one)
 

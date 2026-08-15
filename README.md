@@ -21,7 +21,7 @@ the piece the ecosystem was missing.
 | Version | What it ships |
 |---|---|
 | **0.3.1** (now) | The 0.2 decoder, hardened against crafted RLE2 run lengths, with a `cargo-fuzz` target. See the [ROADMAP](ROADMAP.md). |
-| unreleased (`main`) | The decoder behind a sans-io state machine: `no_std + alloc` core, and `wasm32-unknown-unknown` plus a bare-metal target checked in CI. Plus the pure-Rust **encoder** — `compress`, `Crabz2Writer`, levels 1–9 — verified against system `bzip2`, and the non-default `parallel` feature for multi-core decode. |
+| unreleased (`main`) | The decoder behind a sans-io state machine: `no_std + alloc` core, and `wasm32-unknown-unknown` plus a bare-metal target checked in CI. The [`crabz2-wasm`](crabz2-wasm/) wrapper and its browser demo build on that machine. Plus the pure-Rust **encoder** — `compress`, `Crabz2Writer`, levels 1–9 — verified against system `bzip2`, and the non-default `parallel` feature for multi-core decode. |
 | 0.3.x (roadmap) | Remaining foundation: criterion benchmarks vs libbz2. |
 | 0.4 (roadmap) | A `crabz2-wasm` npm package with a streaming JS API. |
 | 0.2 | Own from-scratch, dependency-free streaming decoder. Verified byte-for-byte against `bzip2`. |
@@ -156,10 +156,35 @@ let plaintext: Vec<u8> = crabz2::decompress_to_vec(&compressed_bytes)?;
 let compressed: Vec<u8> = crabz2::compress(&plaintext, crabz2::Level::BEST);
 ```
 
+The decode state machine underneath is public too, for callers that are *pushed*
+bytes rather than pulling them (a WebAssembly binding, an interrupt handler, an async
+socket): `BlockDecoder::next_block` decodes one block from a `&[u8]`, and `consumed`
+/ `rebase` let you drop what it has committed past, which is what keeps memory at one
+block. Truncation is a restart, not a failure — append more input and call again.
+
 `alloc` is required (the BWT tables and output buffer are heap-allocated); on decode
 every allocation is bounded by the block size declared in the stream header, and on
 encode by the level. CI checks
 `wasm32-unknown-unknown` and `thumbv7em-none-eabihf`, and the MSRV is 1.63.
+
+## WASM / browser
+
+[`crabz2-wasm/`](crabz2-wasm/) is a [wasm-bindgen](https://wasm-bindgen.github.io/wasm-bindgen/)
+wrapper — the same decoder, compiled to about 33 KB of WebAssembly and published to
+npm as [`crabz2`](crabz2-wasm/README.md). It exports `decompress(Uint8Array)` for a
+buffer you already hold, and a push-based `Bz2Decoder` class for files you would
+rather not hold twice:
+
+```js
+const dec = new Bz2Decoder();
+for await (const chunk of file.stream()) parts.push(dec.push(chunk));
+parts.push(dec.finish());
+```
+
+Because it drives the same sans-io state machine, the streaming class holds one block
+rather than the file, whatever its size. [`crabz2-wasm/www/`](crabz2-wasm/www/) is a
+dependency-free demo page: drop a `.bz2` file, watch it decompress in the tab, get the
+result back — nothing is uploaded anywhere.
 
 ### Real-world example: CourtListener bulk data
 

@@ -14,6 +14,13 @@ categories = ["compression"]
 # part of the published package and not a member of this crate's build.
 exclude = ["fuzz"]
 
+# The published library is itself the workspace root, so nothing about how it
+# builds, packages, or resolves changes. `crabz2-wasm` is the wasm-bindgen wrapper
+# behind the npm package; it is a separate crate precisely so the dependency stays
+# out of this one. `fuzz/` declares its own workspace and is not a member.
+[workspace]
+members = [".", "crabz2-wasm"]
+
 # Intentionally empty: a default build of crabz2 has no runtime dependencies. The
 # one optional dependency is declared in its own table below so this stays visibly so.
 [dependencies]
