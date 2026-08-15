@@ -1,18 +1,21 @@
 //! # crabz2
 //!
-//! Pure-Rust bzip2 **decompression** — no C, no bundled `libbz2`, and no third-party
-//! decode crate. `crabz2` implements the full bzip2 decode pipeline from scratch:
-//! bit reader → Huffman → MTF/RLE2 → inverse Burrows–Wheeler transform → RLE1 →
-//! CRC-32/BZIP2 validation.
+//! Pure-Rust bzip2 **compression and decompression** — no C, no bundled `libbz2`, and
+//! no third-party bzip2 crate. `crabz2` implements both pipelines from scratch:
 //!
-//! The core is sans-io and `no_std + alloc`: [`decompress_to_vec`] and the [`Error`]
-//! enum are available with `default-features = false`. The `std` feature (on by
-//! default) adds the `io::Read` adapters — `reader`, `Crabz2Reader`, `decompress` —
-//! and `From<Error> for std::io::Error`.
+//! * decode: bit reader → Huffman → MTF/RLE2 → inverse Burrows–Wheeler transform →
+//!   RLE1 → CRC-32/BZIP2 validation;
+//! * encode: RLE1 → Burrows–Wheeler transform (SA-IS suffix sorting) → MTF/RLE2 →
+//!   length-limited canonical Huffman in 2–6 tables → bit packing.
 //!
-//! It streams: one bzip2 block is decoded at a time and drained through `io::Read`,
-//! so peak memory is bounded to roughly one compressed plus one decompressed block.
-//! Concatenated (multi-stream) `.bz2` input is handled, matching `bzip2 -dc`.
+//! The core is sans-io and `no_std + alloc`: [`decompress_to_vec`], [`compress`] and
+//! the [`Error`] enum are available with `default-features = false`. The `std` feature
+//! (on by default) adds the `io` adapters — `reader`, `Crabz2Reader`, `decompress`,
+//! `writer`, `Crabz2Writer` — and `From<Error> for std::io::Error`.
+//!
+//! Both directions stream: one bzip2 block is processed at a time and drained through
+//! `io::Read` or `io::Write`, so peak memory is bounded to roughly one block.
+//! Concatenated (multi-stream) `.bz2` input is handled on decode, matching `bzip2 -dc`.
 //!
 //! ## Example
 //!
@@ -42,6 +45,14 @@
 //! assert_eq!(data, b"hello crabz2\n");
 //! # Ok::<(), crabz2::Error>(())
 //! ```
+//!
+//! Compressing. [`compress`] works everywhere; [`writer`] is the `std` streaming form:
+//!
+//! ```
+//! let packed = crabz2::compress(b"hello crabz2\n", crabz2::Level::BEST);
+//! assert_eq!(crabz2::decompress_to_vec(&packed)?, b"hello crabz2\n");
+//! # Ok::<(), crabz2::Error>(())
+//! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -52,7 +63,11 @@ use alloc::vec::Vec;
 use core::fmt;
 
 #[cfg(feature = "std")]
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+
+mod encode;
+
+pub use encode::{compress, Level};
 
 const BLOCK_MAGIC: u64 = 0x3141_5926_5359; // pi digits
 const EOS_MAGIC: u64 = 0x1772_4538_5090; // sqrt(pi) digits
@@ -769,6 +784,94 @@ pub fn decompress(compressed: &[u8]) -> io::Result<Vec<u8>> {
     Ok(decompress_to_vec(compressed)?)
 }
 
+/// A streaming, from-scratch, pure-Rust bzip2 compressor implementing [`std::io::Write`].
+///
+/// Plaintext written here is compressed a block at a time and pushed straight into the
+/// wrapped writer, so peak memory stays around one block regardless of input size.
+///
+/// **You must call [`finish`](Crabz2Writer::finish)**: the end-of-stream marker and the
+/// combined-stream CRC are only written there. Dropping the writer without finishing
+/// leaves a truncated `.bz2`.
+#[cfg(feature = "std")]
+pub struct Crabz2Writer<W: Write> {
+    inner: Option<W>,
+    enc: Option<encode::Encoder>,
+}
+
+#[cfg(feature = "std")]
+impl<W: Write> Crabz2Writer<W> {
+    /// Create a compressor writing a `.bz2` stream into `inner`.
+    pub fn new(inner: W, level: Level) -> Self {
+        Crabz2Writer {
+            inner: Some(inner),
+            enc: Some(encode::Encoder::new(level)),
+        }
+    }
+
+    /// Push whatever compressed bytes are ready into the wrapped writer.
+    fn drain(&mut self) -> io::Result<()> {
+        let ready = self.enc.as_mut().expect("writer already finished").drain();
+        if !ready.is_empty() {
+            self.inner
+                .as_mut()
+                .expect("writer already finished")
+                .write_all(&ready)?;
+        }
+        Ok(())
+    }
+
+    /// Finish the stream — writes the end-of-stream marker and stream CRC — and return
+    /// the wrapped writer.
+    pub fn finish(mut self) -> io::Result<W> {
+        let tail = self.enc.take().expect("writer already finished").finish();
+        let mut inner = self.inner.take().expect("writer already finished");
+        inner.write_all(&tail)?;
+        inner.flush()?;
+        Ok(inner)
+    }
+}
+
+#[cfg(feature = "std")]
+impl<W: Write> Write for Crabz2Writer<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.enc
+            .as_mut()
+            .expect("writer already finished")
+            .push(buf);
+        self.drain()?;
+        Ok(buf.len())
+    }
+
+    /// Flushes only what is already compressed. bzip2 has no mid-block sync point, so
+    /// buffered plaintext stays buffered until its block fills.
+    fn flush(&mut self) -> io::Result<()> {
+        self.drain()?;
+        self.inner
+            .as_mut()
+            .expect("writer already finished")
+            .flush()
+    }
+}
+
+/// Wrap a [`Write`] sink in a streaming pure-Rust bzip2 compressor.
+///
+/// Call [`Crabz2Writer::finish`] when done; dropping without it truncates the stream.
+///
+/// ```
+/// use std::io::Write;
+///
+/// let mut w = crabz2::writer(Vec::new(), crabz2::Level::BEST);
+/// w.write_all(b"hello crabz2\n")?;
+/// let compressed = w.finish()?;
+///
+/// assert_eq!(crabz2::decompress(&compressed)?, b"hello crabz2\n");
+/// # Ok::<(), std::io::Error>(())
+/// ```
+#[cfg(feature = "std")]
+pub fn writer<W: Write>(inner: W, level: Level) -> Crabz2Writer<W> {
+    Crabz2Writer::new(inner, level)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1007,5 +1110,26 @@ mod tests {
             Error::Truncated.to_string(),
             "unexpected end of bzip2 stream"
         );
+    }
+
+    // The two halves of the crate, checked against each other on the no_std path.
+    #[test]
+    fn round_trips_through_our_own_encoder() {
+        let data = b"hello crabz2\n";
+        assert_eq!(
+            decompress_to_vec(&compress(data, Level::BEST)).unwrap(),
+            data
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn writer_produces_a_stream_the_reader_accepts() {
+        use std::io::Write as _;
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let mut w = writer(Vec::new(), Level::FASTEST);
+        w.write_all(&data).unwrap();
+        let packed = w.finish().unwrap();
+        assert_eq!(decompress(&packed).unwrap(), data);
     }
 }

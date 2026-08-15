@@ -12,7 +12,7 @@ others sit on.
 | 4 | (M) Benchmarks vs libbz2, numbers in README | 0.3.x | — |
 | 5 | (M) Parallel block decode (`parallel` feature) | 0.4 | 1 |
 | 6 | (M) WASM wrapper crate + npm package | 0.4 | 1, 2 |
-| 7 | (M) Encoder — pure-Rust bzip2 compression | 0.5 | 1 (conventions only) |
+| 7 | (M) Encoder — pure-Rust bzip2 compression | **shipped** (`main`) | 1 (conventions only) |
 | 8 | Announcement (r/rust, TWiR) | after 0.4 | 4, 5, 6 |
 
 The core crate keeps its invariant: **zero runtime dependencies**. Everything
@@ -127,6 +127,17 @@ the crate's clearest differentiator.
   a fixture).
 
 ## 7. Encoder (the big one)
+
+**Status: shipped on `main`.** `src/encode/` implements the pipeline below;
+`compress(&[u8], Level)` and `writer(W, Level) -> Crabz2Writer<W>` are public.
+All three verification bars hold, and compressed size came in slightly *under*
+libbz2's at every level measured (see the README table). Two notes against the
+design as written: the code-length cap is **17**, not the 20 our decoder's delta
+reader would accept, because 17 is what libbz2 emits and staying in that window
+keeps third-party decoders happy; and RLE1 runs as an incremental splitter over
+the input stream rather than a buffer-at-a-time pass, so a block boundary always
+falls between two self-contained RLE1 groups. Parallel *encode* remains out of
+scope, as planned.
 
 **Why.** Decode-only excludes half the audience; a pure-Rust MIT bzip2
 *encoder* does not exist in the ecosystem. This completes the story.
