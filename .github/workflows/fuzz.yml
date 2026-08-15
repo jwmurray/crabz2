@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   smoke:
-    name: fuzz_decompress (60s)
+    name: fuzz targets (60s each)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -45,11 +45,25 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
-      - name: Smoke run
+      - name: Smoke run — fuzz_decompress
         run: >
           cargo fuzz run fuzz_decompress --
           -max_total_time=60
           -max_len=16384
+          -rss_limit_mb=4096
+
+      # A larger -max_len than the decode target on purpose: level 1 fills a
+      # block at 100 kB of RLE1 output, and block boundaries are where a
+      # streaming encoder goes wrong. -len_control=0 is what actually makes it
+      # bite -- libFuzzer otherwise ramps the length up so gradually that a
+      # short run never gets near the limit, and no second block is ever
+      # emitted.
+      - name: Smoke run — fuzz_roundtrip
+        run: >
+          cargo fuzz run fuzz_roundtrip --
+          -max_total_time=60
+          -max_len=150000
+          -len_control=0
           -rss_limit_mb=4096
 
       - name: Upload crash artifacts
