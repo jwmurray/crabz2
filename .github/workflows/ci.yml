@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo test
+      - name: test no_std core (host)
+        run: cargo test --no-default-features
+
+  msrv:
+    name: MSRV 1.63
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.63 --profile minimal
+      # The library has zero runtime dependencies, so rustc alone builds and runs
+      # its whole test suite. Driving this through cargo would pull in the
+      # dev-dependency HTTPS client used by the `courtlistener` example — never
+      # part of a consumer's graph, and it requires a newer rustc than crabz2
+      # does. The MSRV promise is about the published library; this gate tests it
+      # directly, in both feature configurations.
+      - name: unit tests, std
+        run: |
+          rustup run 1.63 rustc --test --edition 2021 --crate-name crabz2 \
+            --cfg 'feature="std"' -D warnings src/lib.rs -o msrv-std
+          ./msrv-std
+      - name: unit tests, no_std + alloc
+        run: |
+          rustup run 1.63 rustc --test --edition 2021 --crate-name crabz2 \
+            -D warnings src/lib.rs -o msrv-nostd
+          ./msrv-nostd
+
+  lint:
+    name: clippy + rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo fmt --check
+
+  cross:
+    name: cross-target check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - run: rustup target add wasm32-unknown-unknown thumbv7em-none-eabihf
+      - name: wasm32 (std feature on, as published)
+        run: cargo check --target wasm32-unknown-unknown
+      - name: bare-metal no_std
+        run: cargo check --no-default-features --target thumbv7em-none-eabihf

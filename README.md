@@ -14,7 +14,8 @@ project, open or closed, with no attribution obligation beyond the MIT notice.
 
 | Version | What it ships |
 |---|---|
-| **0.3.0** (now) | The 0.2 decoder behind a sans-io state machine: `no_std + alloc` core, `cargo-fuzz` target, and `wasm32-unknown-unknown` plus bare-metal targets checked in CI. See the [ROADMAP](ROADMAP.md). |
+| **0.3.1** (now) | The 0.2 decoder, hardened against crafted RLE2 run lengths, with a `cargo-fuzz` target. See the [ROADMAP](ROADMAP.md). |
+| unreleased (`main`) | The decoder behind a sans-io state machine: `no_std + alloc` core, and `wasm32-unknown-unknown` plus a bare-metal target checked in CI. |
 | 0.3.x (roadmap) | Remaining foundation: criterion benchmarks vs libbz2. |
 | 0.4 (roadmap) | `parallel` feature: rayon-backed parallel block decode with in-order reassembly (bzip2 blocks are independent, so they scale across cores) — and a `crabz2-wasm` npm package with a streaming JS API. |
 | 0.5 (roadmap) | Pure-Rust **encoder** — the piece the ecosystem lacks. See [ROADMAP](ROADMAP.md) for the design. |

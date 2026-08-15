@@ -857,8 +857,8 @@ mod tests {
         w.put(u32::from(b'h'), 8);
         w.put(u32::from(b'9'), 8);
 
-        w.put(0x3141_59, 24); // block magic, high half
-        w.put(0x26_5359, 24); // block magic, low half
+        w.put(0x314159, 24); // block magic, high half
+        w.put(0x265359, 24); // block magic, low half
         w.put(0, 32); // block CRC (never reached)
         w.put(0, 1); // not randomized
         w.put(0, 24); // orig_ptr
