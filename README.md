@@ -1,5 +1,7 @@
 # crabz2
 
+[![CI](https://github.com/jwmurray/crabz2/actions/workflows/ci.yml/badge.svg)](https://github.com/jwmurray/crabz2/actions/workflows/ci.yml)
+
 Pure-Rust **bzip2 decompression** — no C, no bundled `libbz2`, no third-party decode
 crate. 🦀
 
@@ -12,8 +14,9 @@ project, open or closed, with no attribution obligation beyond the MIT notice.
 
 | Version | What it ships |
 |---|---|
-| **0.3.0** (now) | The 0.2 decoder, verified to compile untouched for `wasm32-unknown-unknown`, plus the project [ROADMAP](ROADMAP.md). |
-| 0.3.x (roadmap) | Foundations: `no_std + alloc`, CI, `cargo-fuzz` targets, criterion benchmarks vs libbz2. |
+| **0.3.1** (now) | The 0.2 decoder, hardened against crafted RLE2 run lengths, with a `cargo-fuzz` target. See the [ROADMAP](ROADMAP.md). |
+| unreleased (`main`) | The decoder behind a sans-io state machine: `no_std + alloc` core, and `wasm32-unknown-unknown` plus a bare-metal target checked in CI. |
+| 0.3.x (roadmap) | Remaining foundation: criterion benchmarks vs libbz2. |
 | 0.4 (roadmap) | `parallel` feature: rayon-backed parallel block decode with in-order reassembly (bzip2 blocks are independent, so they scale across cores) — and a `crabz2-wasm` npm package with a streaming JS API. |
 | 0.5 (roadmap) | Pure-Rust **encoder** — the piece the ecosystem lacks. See [ROADMAP](ROADMAP.md) for the design. |
 | 0.2 | Own from-scratch, dependency-free streaming decoder. Verified byte-for-byte against `bzip2`. |
@@ -41,6 +44,28 @@ There's also a tiny example CLI:
 cargo run --release --example crabz2 -- file.bz2 > file
 ```
 
+## `no_std`
+
+The decoder itself is sans-io: a state machine over `&[u8]` and a bit cursor, with no
+`io` types in it. `std` is a default feature that adds only the adapters —
+`Crabz2Reader<R: Read>`, `reader`, `decompress`, and `From<Error> for io::Error`.
+
+```toml
+[dependencies]
+crabz2 = { version = "0.3", default-features = false }   # no_std + alloc
+```
+
+Without `std` the buffer API is `decompress_to_vec`, returning the crate's own
+[`Error`](src/lib.rs) enum (`InvalidMagic`, `Truncated`, `CrcMismatch`, …):
+
+```rust
+let plaintext: Vec<u8> = crabz2::decompress_to_vec(&compressed_bytes)?;
+```
+
+`alloc` is required (the BWT tables and output buffer are heap-allocated); every
+allocation is bounded by the block size declared in the stream header. CI checks
+`wasm32-unknown-unknown` and `thumbv7em-none-eabihf`, and the MSRV is 1.63.
+
 ### Real-world example: CourtListener bulk data
 
 [`examples/courtlistener.rs`](examples/courtlistener.rs) streams a bzip2-compressed
@@ -60,7 +85,8 @@ is **not** in the dependency graph for anyone who depends on `crabz2`).
 
 ## Correctness
 
-`crabz2` streams one block at a time (peak memory ≈ one decompressed block), handles
+`crabz2` streams one block at a time (peak memory ≈ one compressed plus one
+decompressed block), handles
 concatenated multi-stream `.bz2` input, verifies both the per-block and combined-stream
 CRCs, and errors loudly on truncated or corrupt input rather than emitting partial
 garbage. It is tested byte-for-byte against system `bzip2` across block levels 1–9,

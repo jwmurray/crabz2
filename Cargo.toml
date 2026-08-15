@@ -22,6 +22,19 @@ exclude = ["fuzz"]
 ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [features]
-default = []
+default = ["std"]
+# `std` adds the `io::Read` adapters (`reader`, `Crabz2Reader`, `decompress`) and
+# `From<Error> for io::Error`. Without it the crate is `no_std + alloc`: the sans-io
+# decoder and `decompress_to_vec` remain available.
+std = []
 # Reserved for a rayon-backed parallel block decoder. Not yet implemented.
 parallel = []
+
+# The examples are std-only CLIs; skip them under --no-default-features.
+[[example]]
+name = "crabz2"
+required-features = ["std"]
+
+[[example]]
+name = "courtlistener"
+required-features = ["std"]
