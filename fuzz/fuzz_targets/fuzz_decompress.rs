@@ -65,7 +65,8 @@ const BWT_BYTES_PER_ENTRY: usize = 4;
 /// buffers, so allow the ideal figure to be exceeded by a small constant.
 const GROWTH_SLACK: usize = 3;
 
-/// Fixed overhead: the 64 KiB bit-reader buffer, per-block Huffman tables,
+/// Fixed overhead: the compressed input the streaming adapter buffers (about one
+/// block, itself bounded by the declared level), per-block Huffman tables,
 /// selector and MTF vectors, and the copy buffer used to drain the stream.
 const FIXED_OVERHEAD: usize = 2 << 20;
 
