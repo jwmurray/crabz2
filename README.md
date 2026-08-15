@@ -202,6 +202,38 @@ Speed is mixed and not yet tuned; that is what the benchmark workstream in the
 than crabz2; on highly repetitive input the ranking flips, because SA-IS is O(n) where
 libbz2's block sorter degrades. Decompression speed is unchanged by this work.
 
+## Serial decode speed vs libbz2
+
+Single-thread decode throughput, **Apple M-series (M5 Max, macOS), one core**, measured
+with `cargo bench` (criterion) against **libbz2 1.0.8** — the C reference, compiled from
+source by `bzip2-sys` and driven through the `bzip2` crate — decoding the exact same
+streams. Each input is 10 MiB of plaintext compressed with `bzip2 -9`; throughput is
+plaintext bytes out per second. The corpora are generated at bench time by a seeded
+PRNG, so `cargo bench` reproduces them anywhere and nothing large is checked in.
+
+| Input (10 MiB) | `bzip2 -9` ratio | crabz2 | libbz2 (C) | crabz2 vs C |
+|---|---|---|---|---|
+| English-like text | 3.8x | 56 MB/s | 57 MB/s | −2% |
+| CSV, court bulk-data shape | 6.0x | 71 MB/s | 74 MB/s | −4% |
+| Incompressible random bytes | 1.0x | 43 MB/s | 34 MB/s | +29% |
+
+Figures are the best of five runs on a machine that was not otherwise idle; contention
+only ever costs throughput, and the run-to-run spread reached 10%.
+
+The honest summary: on compressible input the from-scratch decoder lands a couple of
+percent behind C — close enough that prose and CSV are best read as parity rather than
+a win either way — and about 30% ahead on incompressible input, where the RLE1 pass has
+nothing to expand. This is one microarchitecture (aarch64) and one compiler pair; the
+remaining difference has not been profiled and no inner-loop micro-optimization has been
+done. Multi-core numbers are in [Parallel decode](#parallel-decode) above.
+
+The benchmark also cross-validates: every corpus must decode byte-identically through
+crabz2 before it is timed.
+
+```sh
+cargo bench
+```
+
 ## Correctness
 
 `crabz2` streams one block at a time (peak memory ≈ one compressed plus one
