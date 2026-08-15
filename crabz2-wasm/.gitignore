@@ -1,0 +1,4 @@
+# wasm-pack output. Built by build.sh; never committed.
+/pkg
+/pkg-node
+/www/pkg

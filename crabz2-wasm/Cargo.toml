@@ -1,0 +1,22 @@
+[package]
+name = "crabz2-wasm"
+version = "0.4.0"
+edition = "2021"
+license = "MIT"
+description = "wasm-bindgen wrapper around crabz2: pure-Rust bzip2 decompression in the browser."
+repository = "https://github.com/jwmurray/crabz2"
+# This crate exists for npm (published as `crabz2` via wasm-pack), not crates.io.
+# The Rust package cannot be named `crabz2` because it shares a workspace with the
+# library of that name; `build.sh` rewrites the npm name.
+publish = false
+
+[lib]
+# `cdylib` is what wasm-pack links; `rlib` keeps `cargo test -p crabz2-wasm` and
+# host builds of the workspace working.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The wrapper takes the core in its `no_std + alloc` configuration: the `std`
+# feature only adds `io::Read` adapters, and nothing here reads from an io source.
+crabz2 = { path = "..", default-features = false }
+wasm-bindgen = "0.2"
