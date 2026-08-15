@@ -11,7 +11,9 @@
 //! The core is sans-io and `no_std + alloc`: [`decompress_to_vec`], [`compress`] and
 //! the [`Error`] enum are available with `default-features = false`. The `std` feature
 //! (on by default) adds the `io` adapters — `reader`, `Crabz2Reader`, `decompress`,
-//! `writer`, `Crabz2Writer` — and `From<Error> for std::io::Error`.
+//! `writer`, `Crabz2Writer` — and `From<Error> for std::io::Error`. [`BlockDecoder`]
+//! is the decode machine underneath, for callers that are pushed bytes rather than
+//! pulling them.
 //!
 //! Both directions stream: one bzip2 block is processed at a time and drained through
 //! `io::Read` or `io::Write`, so peak memory is bounded to roughly one block.
@@ -338,19 +340,48 @@ enum Phase {
 
 /// One step of the sans-io machine: a block's plaintext was appended, or the input
 /// ended cleanly at a stream boundary.
-enum Step {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// One block's plaintext was appended to the output buffer.
     Block,
+    /// The input ran out at a clean boundary — after a stream's end-of-stream
+    /// marker, or before any header. Nothing was appended. For a whole buffer this
+    /// is the end of the data; for a caller still receiving input it only means the
+    /// bytes in hand are fully consumed and a concatenated stream may still follow.
     Eof,
 }
 
 /// The whole decoder, free of io: it consumes `&[u8]` from a committed bit position
 /// and appends plaintext to a caller-supplied `Vec`.
 ///
-/// Restart doctrine: [`Error::Truncated`] leaves `bit` at the last committed boundary
-/// (stream header, block, end-of-stream) and `out` at the length it had on entry, so
-/// a caller that can obtain more input may append it and call again. Every other error
-/// is terminal.
-struct BlockDecoder {
+/// Restart doctrine: [`Error::Truncated`] leaves the cursor at the last committed
+/// boundary (stream header, block, end-of-stream) and `out` at the length it had on
+/// entry, so a caller that can obtain more input may append it and call again. Every
+/// other error is terminal. Note that this is restart, not resume: a partially read
+/// block is decoded again from its start once the rest of its bytes arrive, so a
+/// caller feeding tiny increments should wait for a meaningful amount of new input
+/// before retrying rather than retrying on every byte.
+///
+/// [`consumed`](BlockDecoder::consumed) and [`rebase`](BlockDecoder::rebase) let a
+/// caller drop the bytes behind the committed position, which is what bounds memory
+/// to roughly one block; the sub-byte offset is preserved across a rebase.
+///
+/// ```
+/// # const HELLO: &[u8] = &[
+/// #     0x42, 0x5a, 0x68, 0x39, 0x31, 0x41, 0x59, 0x26, 0x53, 0x59, 0x71, 0x1c, 0x50, 0xc0, 0x00,
+/// #     0x00, 0x03, 0xd9, 0x80, 0x00, 0x10, 0x40, 0x00, 0x10, 0x00, 0x3a, 0x44, 0x90, 0x10, 0x20,
+/// #     0x00, 0x31, 0x03, 0x40, 0xd0, 0x29, 0x80, 0x1e, 0xa2, 0xe0, 0x4c, 0xed, 0x69, 0xe0, 0xe1,
+/// #     0x77, 0x24, 0x53, 0x85, 0x09, 0x07, 0x11, 0xc5, 0x0c, 0x00,
+/// # ];
+/// use crabz2::{BlockDecoder, Step};
+///
+/// let mut dec = BlockDecoder::new();
+/// let mut out = Vec::new();
+/// while dec.next_block(HELLO, &mut out)? == Step::Block {}
+/// assert_eq!(out, b"hello crabz2\n");
+/// # Ok::<(), crabz2::Error>(())
+/// ```
+pub struct BlockDecoder {
     bit: usize,
     phase: Phase,
     block_size: usize,
@@ -359,8 +390,15 @@ struct BlockDecoder {
     tt: Vec<u32>,
 }
 
+impl Default for BlockDecoder {
+    fn default() -> Self {
+        BlockDecoder::new()
+    }
+}
+
 impl BlockDecoder {
-    fn new() -> Self {
+    /// A decoder positioned at the start of a stream.
+    pub fn new() -> Self {
         BlockDecoder {
             bit: 0,
             phase: Phase::StreamStart,
@@ -370,9 +408,27 @@ impl BlockDecoder {
         }
     }
 
+    /// Whole bytes of the input slice the decoder has committed past. Everything
+    /// before this offset may be dropped, provided the drop is announced with
+    /// [`rebase`](BlockDecoder::rebase).
+    pub fn consumed(&self) -> usize {
+        self.bit >> 3
+    }
+
+    /// Announce that `n` bytes were removed from the front of the input slice, so
+    /// the next call sees the same stream through a shorter slice.
+    ///
+    /// # Panics
+    ///
+    /// If `n` is past the committed position — those bytes are still needed.
+    pub fn rebase(&mut self, n: usize) {
+        assert!(n <= self.consumed(), "rebase past the committed position");
+        self.bit -= n * 8;
+    }
+
     /// Decode until one block's plaintext has been appended to `out`, or the input
     /// ends at a stream boundary.
-    fn next_block(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<Step, Error> {
+    pub fn next_block(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<Step, Error> {
         let mark = out.len();
         match self.run(input, out) {
             Ok(step) => Ok(step),
@@ -704,7 +760,7 @@ impl<R: Read> Crabz2Reader<R> {
         if self.src_eof {
             return Ok(false);
         }
-        let unconsumed = self.inbuf.len() - (self.dec.bit >> 3);
+        let unconsumed = self.inbuf.len() - self.dec.consumed();
         let want = CHUNK.max(unconsumed).max(self.dec.block_size);
         let old = self.inbuf.len();
         self.inbuf.resize(old + want, 0);
@@ -730,10 +786,10 @@ impl<R: Read> Crabz2Reader<R> {
     /// Drop the bytes the decoder has committed past; the bit cursor keeps its
     /// sub-byte offset.
     fn compact(&mut self) {
-        let consumed = self.dec.bit >> 3;
+        let consumed = self.dec.consumed();
         if consumed > 0 {
             self.inbuf.drain(..consumed);
-            self.dec.bit &= 7;
+            self.dec.rebase(consumed);
         }
     }
 
@@ -1278,6 +1334,55 @@ mod tests {
                 let _ = decompress_to_vec(&corrupt);
             }
         }
+    }
+
+    // The public sans-io API, driven the way a push-based (non-`Read`) caller has to:
+    // append bytes, retry on `Truncated`, and drop what the decoder committed past.
+    // Peak buffering must stay at the unconsumed remainder, never the whole input.
+    #[test]
+    fn sans_io_api_streams_with_rebase() {
+        let mut cat = Vec::new();
+        cat.extend_from_slice(HELLO_BZ2);
+        cat.extend_from_slice(EMPTY_BZ2);
+        cat.extend_from_slice(HELLO_BZ2);
+
+        let mut dec = BlockDecoder::new();
+        let mut inbuf: Vec<u8> = Vec::new();
+        let mut out = Vec::new();
+        let mut fed = 0usize;
+
+        loop {
+            match dec.next_block(&inbuf, &mut out) {
+                Ok(Step::Block) => {}
+                Ok(Step::Eof) | Err(Error::Truncated) => {
+                    if fed == cat.len() {
+                        break;
+                    }
+                    inbuf.push(cat[fed]);
+                    fed += 1;
+                    continue;
+                }
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+            let n = dec.consumed();
+            inbuf.drain(..n);
+            dec.rebase(n);
+            assert!(
+                inbuf.len() < HELLO_BZ2.len(),
+                "buffer should not accumulate"
+            );
+        }
+
+        assert_eq!(out, b"hello crabz2\nhello crabz2\n");
+        // Everything was consumed: a clean `Eof` leaves nothing unread.
+        assert_eq!(inbuf.len() - dec.consumed(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "rebase past the committed position")]
+    fn rebase_past_the_cursor_panics() {
+        let mut dec = BlockDecoder::new();
+        dec.rebase(1);
     }
 
     // ---- parallel block decode -------------------------------------------------
