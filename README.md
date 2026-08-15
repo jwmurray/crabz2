@@ -278,16 +278,17 @@ than silently miscorrupted.
 
 ## Fuzzing
 
-A decoder for untrusted input has to say what it is fuzzed for. The
+A codec for untrusted input has to say what it is fuzzed for. The
 [`fuzz/`](fuzz/) directory is a [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz)
 crate (nightly-only, outside the parent crate, so `crabz2` itself stays at zero
 dependencies):
 
 | Target | Input | Asserts |
 |---|---|---|
-| `fuzz_decompress` | arbitrary bytes | the three invariants below |
+| `fuzz_decompress` | arbitrary bytes as a `.bz2` stream | decode invariants 1–3 |
+| `fuzz_roundtrip` | first byte picks the level, rest is plaintext | encode invariants 4–6 |
 
-**Invariants.**
+**Decode invariants.**
 
 1. **Never panics.** Every byte string is either decoded or rejected with an
    `io::Error`. No input can cause an out-of-range index, an arithmetic overflow,
@@ -302,20 +303,40 @@ dependencies):
    produce an `Err`, never partial or fabricated plaintext, and the streaming
    `reader` and buffering `decompress` always agree on validity and output length.
 
+**Encode invariants.**
+
+4. **Never panics.** No plaintext, however degenerate, aborts the compressor.
+5. **Lossless round trip.** `decompress(compress(data, level)) == data` byte for
+   byte, at every level 1–9. The level is taken from the first input byte so the
+   fuzzer explores all nine block sizes, and the stream is checked to declare the
+   level it was asked for.
+6. **Chunking is invisible.** Feeding the same plaintext to `Crabz2Writer` in
+   arbitrary, input-derived chunk sizes — including zero-length writes — produces
+   byte-identical output to one-shot `compress`. The RLE1 splitter carries run
+   state across `push` calls, so this is where a streaming encoder goes wrong.
+
 The committed seed corpus holds the crate's own test vectors, small files compressed
 by system `bzip2` at levels 1 and 9 (prose, run-heavy, incompressible, and full-256
-byte alphabets), concatenated multi-stream files, and minimized inputs from past
-findings. CI runs a 60-second smoke pass of each target on nightly, on pull requests
-touching `src/` and on a weekly schedule; longer campaigns are run out of band.
+byte alphabets), concatenated multi-stream files, RLE1 run-length edge cases, and
+minimized inputs from past findings. CI runs a 60-second smoke pass of each target on
+nightly, on pull requests touching `src/` and on a weekly schedule; longer campaigns
+are run out of band.
 
 ```sh
 cargo +nightly fuzz run fuzz_decompress -- -max_total_time=300
+cargo +nightly fuzz run fuzz_roundtrip  -- -max_total_time=300 -max_len=150000 -len_control=0
 ```
 
-**Findings.** Fuzzing this target found one real bug, fixed in 0.3.x: the RLE2
-zero-run accumulator shifted by an attacker-controlled bit count, so a stream of
-more than 64 consecutive RUNA/RUNB symbols panicked with a shift overflow instead
-of being rejected. Runs are now bounded by the declared block size, as libbz2 does.
+The round-trip target wants the larger `-max_len`: level 1 fills a block at 100 kB of
+RLE1 output, and anything smaller never emits a second block, leaving the block
+boundary logic untested. `-len_control=0` is what makes that limit bite — libFuzzer
+otherwise ramps input length up so gradually that a short run never approaches it.
+
+**Findings.** Fuzzing found one real bug, fixed in 0.3.1: the RLE2 zero-run
+accumulator shifted by an attacker-controlled bit count, so a stream of more than 64
+consecutive RUNA/RUNB symbols panicked with a shift overflow instead of being
+rejected. Runs are now bounded by the declared block size, as libbz2 does. The
+round-trip target has not turned up an encoder defect.
 
 ## License
 
