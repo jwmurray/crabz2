@@ -19,6 +19,12 @@ jobs:
       - run: cargo test
       - name: test no_std core (host)
         run: cargo test --no-default-features
+      # The parallel decoder's whole contract is that it agrees with the serial one,
+      # so its tests are the serial tests plus the fixtures that make disagreement
+      # possible. Stable only: rayon's MSRV is its own business, and the gate below
+      # never builds this feature.
+      - name: test parallel block decode
+        run: cargo test --features parallel
 
   msrv:
     name: MSRV 1.63
@@ -50,6 +56,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features parallel -- -D warnings
       - run: cargo fmt --check
 
   cross:
