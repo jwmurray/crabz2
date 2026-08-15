@@ -31,6 +31,9 @@ const pkg = JSON.parse(fs.readFileSync(path, "utf8"));
 pkg.name = "crabz2";
 pkg.homepage = "https://github.com/jwmurray/crabz2";
 pkg.keywords = ["bzip2", "bz2", "decompress", "wasm", "webassembly", "rust"];
+// npm ships a file named LICENSE without being asked; ours is LICENSE-MIT, so it
+// has to be listed or the tarball would carry an MIT declaration and no text.
+if (!pkg.files.includes("LICENSE-MIT")) pkg.files.push("LICENSE-MIT");
 fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + "\n");
 ' "$out/package.json"
 
