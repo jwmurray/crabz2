@@ -21,9 +21,9 @@ the piece the ecosystem was missing.
 | Version | What it ships |
 |---|---|
 | **0.3.1** (now) | The 0.2 decoder, hardened against crafted RLE2 run lengths, with a `cargo-fuzz` target. See the [ROADMAP](ROADMAP.md). |
-| unreleased (`main`) | The decoder behind a sans-io state machine: `no_std + alloc` core, and `wasm32-unknown-unknown` plus a bare-metal target checked in CI. Plus the pure-Rust **encoder** — `compress`, `Crabz2Writer`, levels 1–9 — verified against system `bzip2`. |
+| unreleased (`main`) | The decoder behind a sans-io state machine: `no_std + alloc` core, and `wasm32-unknown-unknown` plus a bare-metal target checked in CI. Plus the pure-Rust **encoder** — `compress`, `Crabz2Writer`, levels 1–9 — verified against system `bzip2`, and the non-default `parallel` feature for multi-core decode. |
 | 0.3.x (roadmap) | Remaining foundation: criterion benchmarks vs libbz2. |
-| 0.4 (roadmap) | `parallel` feature: rayon-backed parallel block decode with in-order reassembly (bzip2 blocks are independent, so they scale across cores) — and a `crabz2-wasm` npm package with a streaming JS API. |
+| 0.4 (roadmap) | A `crabz2-wasm` npm package with a streaming JS API. |
 | 0.2 | Own from-scratch, dependency-free streaming decoder. Verified byte-for-byte against `bzip2`. |
 | 0.1 | Thin wrapper over `bzip2-rs` (superseded; `0.1.0` remains dual `MIT OR Apache-2.0`). |
 
@@ -73,6 +73,67 @@ There's also a tiny example CLI:
 ```sh
 cargo run --release --example crabz2 -- file.bz2 > file
 ```
+
+## Parallel decode
+
+bzip2 blocks are independent — own Huffman tables, own BWT, own CRC — so a multi-block
+file can be decoded across cores. That is what `lbzip2` does out of process; the
+`parallel` feature does it in yours:
+
+```toml
+[dependencies]
+crabz2 = { version = "0.3", features = ["parallel"] }
+```
+
+```rust
+// None uses one worker per core; Some(n) uses a private pool of n.
+let plaintext = crabz2::decompress_parallel(&compressed_bytes, None)?;
+```
+
+The feature is **off by default** and additive: without it the crate still has zero
+dependencies and the serial decoder compiles exactly as before. `rayon` is the only
+dependency the crate has ever had, and only under this flag.
+
+**How it finds the blocks.** The format has no block index and no length fields, and a
+block begins at an arbitrary *bit* offset — you cannot know where block *n+1* starts
+without decoding block *n*. So the decoder guesses: a scanner sweeps the compressed
+bytes with a rolling 64-bit window and reports every bit offset carrying the 48-bit
+block magic `0x314159265359`. Each candidate is decoded speculatively on the pool, and
+the results are then chained in order — a decoded block counts only if it begins
+exactly where the previous accepted block ended. The magic can also occur *inside*
+entropy-coded data; such a candidate either fails to decode (usually within a few
+hundred bits) or is simply never reached by the chain.
+
+**The rule.** Output is byte-identical to `decompress`, for every input, valid or not,
+and the same errors are reported for the same reasons. A block is committed only when
+the serial decoder would have produced exactly those bytes from exactly those bits;
+anything else — a bad header, a missing or failed candidate at a chain position, a
+block bigger than the declared level allows, a CRC mismatch — re-decodes serially from
+the last committed boundary. Degrading to serial is always allowed; degrading to
+different bytes is not. The tests assert the identity over the fixtures, the fuzz
+corpus, every truncation of a multi-block stream, and every single-bit flip in one.
+
+**Numbers.** Apple M5 Max, 18 cores; 100 MB of mixed prose and incompressible data
+(26 MB for the level-1 column), decoded from a buffer:
+
+| Threads | level 9 (54.8 MB in, 117 blocks) | level 1 (13.8 MB in, 263 blocks) |
+|---|---|---|
+| 1 (serial) | 69 MB/s — 1.00× | 90 MB/s — 1.00× |
+| 2 | 107 MB/s — 1.54× | 129 MB/s — 1.43× |
+| 4 | 191 MB/s — 2.77× | 246 MB/s — 2.73× |
+| 8 | 338 MB/s — 4.89× | 484 MB/s — 5.36× |
+| 16 | 526 MB/s — 7.62× | 853 MB/s — 9.44× |
+
+Throughput is plaintext bytes per second. Scaling tracks the block count, so a file
+below the level's block size (900 KB of input at level 9) has nothing to divide and
+costs what serial costs. Reproduce with the example CLI:
+
+```sh
+cargo run --release --features parallel --example parallel -- file.bz2 8 > /dev/null
+```
+
+**Not offered on wasm.** `parallel` needs OS threads; enabling it for a `wasm` target
+is a `compile_error!` rather than a runtime surprise.
 
 ## `no_std`
 

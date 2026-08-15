@@ -14,7 +14,16 @@ categories = ["compression"]
 # part of the published package and not a member of this crate's build.
 exclude = ["fuzz"]
 
+# Intentionally empty: a default build of crabz2 has no runtime dependencies. The
+# one optional dependency is declared in its own table below so this stays visibly so.
 [dependencies]
+
+# Pulled in only by the non-default `parallel` feature. 1.10 is the last release
+# with rayon's own MSRV at 1.63, matching ours; newer minors resolve fine on newer
+# toolchains and the MSRV gate never builds this feature.
+[dependencies.rayon]
+version = "1.10"
+optional = true
 
 # Only used by the `courtlistener` example (a pure-Rust HTTPS client, rustls/no C).
 # Dev-dependencies are NOT part of the published dependency graph for consumers.
@@ -27,8 +36,9 @@ default = ["std"]
 # `From<Error> for io::Error`. Without it the crate is `no_std + alloc`: the sans-io
 # decoder and `decompress_to_vec` remain available.
 std = []
-# Reserved for a rayon-backed parallel block decoder. Not yet implemented.
-parallel = []
+# Rayon-backed parallel block decode: adds `decompress_parallel`. Additive and off by
+# default — with it off the serial decoder compiles exactly as it does today.
+parallel = ["dep:rayon", "std"]
 
 # The examples are std-only CLIs; skip them under --no-default-features.
 [[example]]
@@ -38,3 +48,7 @@ required-features = ["std"]
 [[example]]
 name = "courtlistener"
 required-features = ["std"]
+
+[[example]]
+name = "parallel"
+required-features = ["parallel"]

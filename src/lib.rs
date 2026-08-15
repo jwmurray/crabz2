@@ -17,6 +17,11 @@
 //! `io::Read` or `io::Write`, so peak memory is bounded to roughly one block.
 //! Concatenated (multi-stream) `.bz2` input is handled on decode, matching `bzip2 -dc`.
 //!
+//! The optional, non-default `parallel` feature adds [`decompress_parallel`], which
+//! decodes a multi-block buffer across a rayon thread pool for byte-identical output.
+//! It is the only thing in the crate with a dependency; without it crabz2 still has
+//! none.
+//!
 //! ## Example
 //!
 //! ```no_run
@@ -56,6 +61,14 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
+// A thread pool needs threads. Rather than let `parallel` compile to something that
+// panics or silently runs serially in a browser, refuse the combination outright.
+#[cfg(all(feature = "parallel", target_family = "wasm"))]
+compile_error!(
+    "the `parallel` feature requires OS threads and is not available on wasm targets; \
+     build crabz2 without it (the serial decoder is the same decoder)"
+);
+
 extern crate alloc;
 
 use alloc::vec;
@@ -68,6 +81,11 @@ use std::io::{self, Read, Write};
 mod encode;
 
 pub use encode::{compress, Level};
+
+#[cfg(feature = "parallel")]
+mod parallel;
+#[cfg(feature = "parallel")]
+pub use parallel::decompress_parallel;
 
 const BLOCK_MAGIC: u64 = 0x3141_5926_5359; // pi digits
 const EOS_MAGIC: u64 = 0x1772_4538_5090; // sqrt(pi) digits
@@ -939,6 +957,16 @@ mod tests {
             }
         }
 
+        /// Copy the bit range `[start, end)` out of another stream verbatim. Bzip2
+        /// blocks are not byte-aligned, so re-homing one is a bit-level operation.
+        fn put_range(&mut self, src: &[u8], start: usize, end: usize) {
+            let mut c = BitCursor::new(src, start);
+            for _ in start..end {
+                let b = c.read_bit().expect("bit range inside the source stream");
+                self.put(b, 1);
+            }
+        }
+
         fn finish(mut self) -> Vec<u8> {
             if self.nbits > 0 {
                 let pad = 8 - self.nbits;
@@ -946,6 +974,154 @@ mod tests {
                 self.out.push(self.acc as u8);
             }
             self.out
+        }
+    }
+
+    fn bz_crc(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in data {
+            crc = crc_update(crc, b);
+        }
+        !crc
+    }
+
+    /// Bit ranges of every block in a *single-stream* input, with each block's CRC:
+    /// `(first bit of the block magic, first bit past the block, block CRC)`.
+    fn blocks_of(stream: &[u8]) -> Vec<(usize, usize, u32)> {
+        let mut dec = BlockDecoder::new();
+        let mut out = Vec::new();
+        let mut found = Vec::new();
+        let mut start = 32; // past the four-byte `BZh<level>` header
+        let mut prev = 0u32;
+        loop {
+            match dec.next_block(stream, &mut out).expect("valid stream") {
+                Step::Block => {
+                    // combined = prev.rotate_left(1) ^ block, inverted.
+                    found.push((start, dec.bit, dec.combined_crc ^ prev.rotate_left(1)));
+                    prev = dec.combined_crc;
+                    start = dec.bit;
+                }
+                Step::Eof => return found,
+            }
+        }
+    }
+
+    /// Build one multi-block stream out of the blocks of several single-stream
+    /// inputs. Multi-block fixtures otherwise need an encoder, and the crate does
+    /// not have one; splicing real blocks at their real bit offsets exercises the
+    /// same thing the compressor would produce, including the unaligned handoff
+    /// from one block to the next.
+    fn splice(streams: &[&[u8]]) -> Vec<u8> {
+        let level = streams.iter().map(|s| s[3]).max().expect("no streams");
+        let mut w = BitWriter::new();
+        w.put(u32::from(b'B'), 8);
+        w.put(u32::from(b'Z'), 8);
+        w.put(u32::from(b'h'), 8);
+        w.put(u32::from(level), 8);
+
+        let mut combined = 0u32;
+        for s in streams {
+            for (start, end, crc) in blocks_of(s) {
+                w.put_range(s, start, end);
+                combined = combined.rotate_left(1) ^ crc;
+            }
+        }
+
+        w.put(0x177245, 24); // end-of-stream magic, high half
+        w.put(0x385090, 24); // end-of-stream magic, low half
+        w.put(combined, 32);
+        w.finish()
+    }
+
+    /// The block magic, written out as `pad` leading zero bits followed by the 48
+    /// bits of the pattern, then closed so the whole thing parses as a sequence of
+    /// unary selector codes. Returns the bits and how many selectors they encode.
+    fn selector_bits_carrying_magic(pad: usize) -> (Vec<u8>, usize) {
+        let mut bits = vec![0u8; pad];
+        for i in 0..48 {
+            bits.push(((BLOCK_MAGIC >> (47 - i)) & 1) as u8);
+        }
+        let mut count = 0usize;
+        let mut i = 0usize;
+        while i < bits.len() {
+            let mut run = 0;
+            while i < bits.len() && bits[i] == 1 {
+                run += 1;
+                i += 1;
+            }
+            // A selector is `run` ones then a zero, and must name a group below
+            // n_groups; the magic's longest run of ones is two, so this holds.
+            assert!(run < 6, "selector run of {run} ones is not encodable");
+            if i == bits.len() {
+                bits.push(0);
+            }
+            i += 1;
+            count += 1;
+        }
+        (bits, count)
+    }
+
+    /// A valid one-block stream that contains the 48-bit block magic *inside* the
+    /// block's own data — in the selector list, which is the one section whose bits
+    /// a stream can choose freely. `pad` shifts the pattern's bit alignment.
+    ///
+    /// The block itself decodes to a single `A`: one distinct byte means the whole
+    /// payload is the RUNA that stands for a zero-run of one, then end-of-block.
+    fn magic_inside_block_data(pad: usize) -> Vec<u8> {
+        let (sel, n_selectors) = selector_bits_carrying_magic(pad);
+        let mut w = BitWriter::new();
+        w.put(u32::from(b'B'), 8);
+        w.put(u32::from(b'Z'), 8);
+        w.put(u32::from(b'h'), 8);
+        w.put(u32::from(b'1'), 8);
+
+        w.put(0x314159, 24);
+        w.put(0x265359, 24);
+        w.put(bz_crc(b"A"), 32);
+        w.put(0, 1); // not randomized
+        w.put(0, 24); // orig_ptr
+
+        // Symbol map: 'A' is 0x41, so group 4, member 1.
+        w.put(1 << (15 - 4), 16);
+        w.put(1 << (15 - 1), 16);
+
+        w.put(6, 3); // n_groups: the widest selector alphabet
+        w.put(n_selectors as u32, 15);
+        for b in sel {
+            w.put(u32::from(b), 1);
+        }
+
+        // All six groups: every symbol two bits, so RUNA=00, RUNB=01, EOB=10.
+        for _ in 0..6 {
+            w.put(2, 5);
+            for _ in 0..3 {
+                w.put(0, 1);
+            }
+        }
+
+        w.put(0b00, 2); // RUNA: a zero-run of one, i.e. the single 'A'
+        w.put(0b10, 2); // EOB
+
+        w.put(0x177245, 24);
+        w.put(0x385090, 24);
+        w.put(bz_crc(b"A"), 32); // one block, so combined == block CRC
+        w.finish()
+    }
+
+    #[test]
+    fn spliced_multi_block_stream_decodes() {
+        let s = splice(&[HELLO_BZ2, HELLO_BZ2, HELLO_BZ2]);
+        assert_eq!(
+            decompress_to_vec(&s).unwrap(),
+            b"hello crabz2\nhello crabz2\nhello crabz2\n"
+        );
+    }
+
+    #[test]
+    fn block_carrying_the_magic_in_its_data_decodes() {
+        for pad in 0..8 {
+            let s = magic_inside_block_data(pad);
+            assert_eq!(decompress_to_vec(&s).unwrap(), b"A", "pad {pad}");
         }
     }
 
@@ -1101,6 +1277,294 @@ mod tests {
                 corrupt[byte] ^= 1 << bit;
                 let _ = decompress_to_vec(&corrupt);
             }
+        }
+    }
+
+    // ---- parallel block decode -------------------------------------------------
+    //
+    // Every test here asserts the same property in a different corner: for any input
+    // whatsoever, valid or corrupt, `decompress_parallel` returns exactly what
+    // `decompress` returns. The serial decoder is the oracle; the fixtures are only
+    // there to make the oracle's answer interesting.
+
+    #[cfg(feature = "parallel")]
+    fn assert_matches_serial(input: &[u8], threads: Option<usize>, what: &str) {
+        let serial = decompress(input).map_err(|e| e.to_string());
+        let parallel = decompress_parallel(input, threads).map_err(|e| e.to_string());
+        assert!(
+            serial == parallel,
+            "{what}: parallel({threads:?}) disagrees with serial \
+             (serial {:?}, parallel {:?})",
+            serial.as_ref().map(|v| v.len()),
+            parallel.as_ref().map(|v| v.len()),
+        );
+    }
+
+    /// Deterministic incompressible bytes; bzip2 still blocks them, which is what we
+    /// want — many blocks, no shortcuts.
+    #[cfg(feature = "parallel")]
+    fn pseudo_random(n: usize, seed: u64) -> Vec<u8> {
+        let mut s = seed | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// Highly compressible bytes with enough structure to survive RLE1 and fill
+    /// blocks rather than collapse into one.
+    #[cfg(feature = "parallel")]
+    fn repetitive(n: usize) -> Vec<u8> {
+        let mut v = Vec::with_capacity(n);
+        let mut i = 0u32;
+        while v.len() < n {
+            let line = std::format!("{i:08} the quick brown fox jumps over the lazy dog\n");
+            v.extend_from_slice(line.as_bytes());
+            i = i.wrapping_add(1);
+        }
+        v.truncate(n);
+        v
+    }
+
+    #[cfg(feature = "parallel")]
+    fn system_bzip2(data: &[u8], level: u8, tag: &str) -> Option<Vec<u8>> {
+        use std::process::{Command, Stdio};
+        let path = std::env::temp_dir().join(std::format!(
+            "crabz2-par-{}-{tag}-{level}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, data).ok()?;
+        let run = Command::new("bzip2")
+            .arg(std::format!("-{level}"))
+            .arg("-c")
+            .arg(&path)
+            .stderr(Stdio::null())
+            .output();
+        let _ = std::fs::remove_file(&path);
+        let run = run.ok()?;
+        if !run.status.success() {
+            return None;
+        }
+        Some(run.stdout)
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn parallel_matches_serial_on_the_test_vectors() {
+        let mut cat = Vec::new();
+        cat.extend_from_slice(HELLO_BZ2);
+        cat.extend_from_slice(EMPTY_BZ2);
+        cat.extend_from_slice(HELLO_BZ2);
+
+        let spliced = splice(&[HELLO_BZ2, HELLO_BZ2, HELLO_BZ2, HELLO_BZ2]);
+        let planted = magic_inside_block_data(3);
+        let mixed = splice(&[HELLO_BZ2, &planted, HELLO_BZ2, &planted]);
+
+        let cases: [(&str, &[u8]); 6] = [
+            ("single block", HELLO_BZ2),
+            ("empty stream", EMPTY_BZ2),
+            ("multi-stream", &cat),
+            ("spliced multi-block", &spliced),
+            ("magic planted in block data", &planted),
+            ("multi-block around planted magic", &mixed),
+        ];
+
+        for (what, input) in cases {
+            for threads in [Some(1), Some(2), Some(4), Some(8), None] {
+                assert_matches_serial(input, threads, what);
+            }
+        }
+    }
+
+    /// Multi-block fixtures with no system `bzip2` and nothing checked in: our own
+    /// encoder makes them. It also means the two halves of the crate check each
+    /// other — a block the encoder emits, decoded on a pool, must come back exactly.
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn parallel_matches_serial_on_our_own_compressed_output() {
+        let mut plain = repetitive(160 * 1024);
+        plain.extend_from_slice(&pseudo_random(160 * 1024, 0x243F_6A88_85A3_08D3));
+        plain.extend_from_slice(&repetitive(160 * 1024));
+
+        for level in [Level::FASTEST, Level::new(2).unwrap()] {
+            let compressed = compress(&plain, level);
+            let blocks = blocks_of(&compressed).len();
+            assert!(
+                blocks >= 2,
+                "level {} produced {blocks} blocks",
+                level.get()
+            );
+            assert_eq!(
+                parallel::decode(&compressed).unwrap().1,
+                blocks,
+                "level {}: chain fell back to serial",
+                level.get()
+            );
+            for threads in [Some(2), Some(4), None] {
+                assert!(
+                    decompress_parallel(&compressed, threads).unwrap() == plain,
+                    "level {}, {threads:?} threads",
+                    level.get()
+                );
+            }
+
+            // Concatenating our own streams keeps the multi-stream path in view.
+            let mut cat = compressed.clone();
+            cat.extend_from_slice(&compress(b"tail\n", Level::BEST));
+            let mut expected = plain.clone();
+            expected.extend_from_slice(b"tail\n");
+            assert_eq!(decompress_parallel(&cat, None).unwrap(), expected);
+        }
+    }
+
+    /// A healthy multi-block stream must be decoded entirely by the fast path. Without
+    /// this the suite would still pass if the chain silently gave up and re-decoded
+    /// everything serially — correct output, no parallelism, nobody notices.
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn fast_path_accepts_every_block_of_a_healthy_stream() {
+        let spliced = splice(&[HELLO_BZ2; 5]);
+        let (out, accepted) = parallel::decode(&spliced).unwrap();
+        assert_eq!(accepted, 5, "chain fell back to serial");
+        assert_eq!(out, b"hello crabz2\n".repeat(5));
+
+        // A stream with no blocks at all has nothing to accept, and must still work.
+        let (out, accepted) = parallel::decode(EMPTY_BZ2).unwrap();
+        assert_eq!((out.len(), accepted), (0, 0));
+    }
+
+    /// The declared block size is the one thing that makes a block's decode depend on
+    /// its stream header, and speculation runs before the header is known. Relabelling
+    /// a level-9 stream as level 1 declares a 100 KB block that the real block
+    /// overflows: serial rejects it, so the chain must reject it too rather than
+    /// accept the speculative decode that ran against the 900 KB bound.
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn block_over_the_declared_size_is_rejected_as_serial_does() {
+        let plain = repetitive(400 * 1024);
+        if let Some(mut compressed) = system_bzip2(&plain, 9, "relabel") {
+            assert_eq!(blocks_of(&compressed).len(), 1);
+            compressed[3] = b'1';
+            assert_eq!(decompress_to_vec(&compressed), Err(Error::BlockOverflow));
+            for threads in [Some(2), Some(4), None] {
+                assert_matches_serial(&compressed, threads, "level relabelled to 1");
+            }
+        }
+    }
+
+    /// The planted pattern must actually reach the scanner — otherwise the test
+    /// above proves nothing about false positives. One block, at least two
+    /// candidates: the real one and the one sitting in the selector list.
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn planted_magic_is_a_real_false_positive() {
+        for pad in 0..8 {
+            let s = magic_inside_block_data(pad);
+            let candidates = parallel::scan_candidates(&s);
+            assert_eq!(blocks_of(&s).len(), 1, "pad {pad}");
+            assert!(
+                candidates.len() >= 2,
+                "pad {pad}: planted magic was not found by the scanner ({candidates:?})"
+            );
+            assert_eq!(decompress_parallel(&s, Some(4)).unwrap(), b"A", "pad {pad}");
+        }
+    }
+
+    /// Truncation: the parallel path must report the same error at the same cut,
+    /// never a short but successful read. Candidate blocks past the cut decode or
+    /// fail on their own; only the chain decides what counts.
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn parallel_matches_serial_on_truncated_input() {
+        let spliced = splice(&[HELLO_BZ2, HELLO_BZ2, HELLO_BZ2]);
+        for cut in 0..spliced.len() {
+            assert_matches_serial(&spliced[..cut], None, "truncated multi-block");
+        }
+        for cut in 0..HELLO_BZ2.len() {
+            assert_matches_serial(&HELLO_BZ2[..cut], None, "truncated single block");
+        }
+    }
+
+    /// Corruption: every single-bit flip in a multi-block stream, compared against
+    /// serial. This is where a wrong chain rule shows up — a flipped bit can create
+    /// a candidate, destroy one, or move a block boundary.
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn parallel_matches_serial_on_every_single_bit_flip() {
+        let spliced = splice(&[HELLO_BZ2, HELLO_BZ2, HELLO_BZ2]);
+        for byte in 0..spliced.len() {
+            for bit in 0..8 {
+                let mut corrupt = spliced.clone();
+                corrupt[byte] ^= 1 << bit;
+                assert_matches_serial(&corrupt, None, "bit flip");
+            }
+        }
+    }
+
+    /// The fuzz corpus doubles as a regression corpus here: whatever those inputs
+    /// do serially, they must do in parallel.
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn parallel_matches_serial_on_the_fuzz_corpus() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/fuzz_decompress");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // Not present in a published .crate; nothing to check.
+            Err(_) => return,
+        };
+        let mut seen = 0;
+        for entry in entries.flatten() {
+            let data = match std::fs::read(entry.path()) {
+                Ok(data) => data,
+                Err(_) => continue,
+            };
+            let name = entry.file_name();
+            assert_matches_serial(&data, None, &name.to_string_lossy());
+            assert_matches_serial(&data, Some(2), &name.to_string_lossy());
+            seen += 1;
+        }
+        assert!(seen > 0, "corpus directory {} was empty", dir.display());
+    }
+
+    /// Real multi-block streams from the reference compressor, at both ends of the
+    /// block-size range and over both compressible and incompressible input.
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn parallel_matches_serial_on_system_bzip2_output() {
+        let mut plain = repetitive(700 * 1024);
+        plain.extend_from_slice(&pseudo_random(700 * 1024, 0x9E37_79B9_7F4A_7C15));
+
+        let mut checked = 0;
+        for (level, min_blocks) in [(1u8, 4usize), (9, 2)] {
+            let compressed = match system_bzip2(&plain, level, "mixed") {
+                Some(c) => c,
+                // No bzip2 on this machine.
+                None => continue,
+            };
+            let blocks = blocks_of(&compressed).len();
+            assert!(
+                blocks >= min_blocks,
+                "level {level} produced {blocks} blocks, expected at least {min_blocks}"
+            );
+            assert_eq!(decompress(&compressed).unwrap(), plain);
+            assert_eq!(
+                parallel::decode(&compressed).unwrap().1,
+                blocks,
+                "level {level}: chain fell back to serial"
+            );
+            for threads in [Some(1), Some(2), Some(4), Some(8), None] {
+                let out = decompress_parallel(&compressed, threads).unwrap();
+                assert!(out == plain, "level {level}, {threads:?} threads");
+            }
+            checked += 1;
+        }
+        if checked == 0 {
+            std::eprintln!("system bzip2 not available; skipped");
         }
     }
 
