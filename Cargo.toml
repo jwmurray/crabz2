@@ -4,11 +4,11 @@ version = "0.3.1"
 edition = "2021"
 rust-version = "1.63"
 license = "MIT"
-description = "Pure-Rust bzip2 decompression — own from-scratch decoder, no C, no libbz2, no third-party decode crate."
+description = "Pure-Rust bzip2 compression and decompression — own from-scratch encoder and decoder, no C, no libbz2, no third-party bzip2 crate."
 repository = "https://github.com/jwmurray/crabz2"
 homepage = "https://github.com/jwmurray/crabz2"
 readme = "README.md"
-keywords = ["bzip2", "bz2", "decompression"]
+keywords = ["bzip2", "bz2", "compression", "decompression"]
 categories = ["compression"]
 # The cargo-fuzz crate is nightly-only and has its own dependencies; it is not
 # part of the published package and not a member of this crate's build.
