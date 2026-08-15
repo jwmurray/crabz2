@@ -10,6 +10,9 @@ homepage = "https://github.com/jwmurray/crabz2"
 readme = "README.md"
 keywords = ["bzip2", "bz2", "decompression"]
 categories = ["compression"]
+# The cargo-fuzz crate is nightly-only and has its own dependencies; it is not
+# part of the published package and not a member of this crate's build.
+exclude = ["fuzz"]
 
 [dependencies]
 

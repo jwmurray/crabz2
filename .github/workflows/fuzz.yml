@@ -1,0 +1,61 @@
+name: fuzz
+
+# A short smoke run, not a fuzzing campaign: enough to catch a target that no
+# longer builds or an input in the committed corpus that now crashes. Real
+# campaigns are run out of band and their findings land as corpus seeds.
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'fuzz/**'
+      - '.github/workflows/fuzz.yml'
+  schedule:
+    # Mondays, 05:17 UTC.
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: fuzz_decompress (60s)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            fuzz/target
+          key: fuzz-${{ runner.os }}-${{ hashFiles('fuzz/Cargo.toml') }}
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Smoke run
+        run: >
+          cargo fuzz run fuzz_decompress --
+          -max_total_time=60
+          -max_len=16384
+          -rss_limit_mb=4096
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
