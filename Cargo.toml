@@ -25,10 +25,24 @@ exclude = ["fuzz"]
 version = "1.10"
 optional = true
 
-# Only used by the `courtlistener` example (a pure-Rust HTTPS client, rustls/no C).
 # Dev-dependencies are NOT part of the published dependency graph for consumers.
+# `ureq` is used only by the `courtlistener` example (pure-Rust HTTPS, rustls/no C);
+# `criterion` and `bzip2` (C libbz2 bindings — the benchmark baseline) only by benches.
 [dev-dependencies]
 ureq = { version = "2", default-features = false, features = ["tls"] }
+criterion = { version = "0.5", default-features = false, features = [
+    "cargo_bench_support",
+] }
+bzip2 = "0.4"
+
+# `test = true` makes `cargo test` build and smoke-run the bench binary (criterion's
+# test mode: one iteration each), so the benchmarks cannot rot unnoticed in CI.
+# Criterion itself needs `std`, so the bench is skipped under --no-default-features.
+[[bench]]
+name = "decode"
+harness = false
+test = true
+required-features = ["std"]
 
 [features]
 default = ["std"]
