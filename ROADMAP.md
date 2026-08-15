@@ -9,7 +9,7 @@ others sit on.
 | 1 | (F) `no_std + alloc` core | 0.3.x | — |
 | 2 | (F) CI: tests, clippy, fmt, wasm32 check | 0.3.x | — |
 | 3 | (M) Fuzzing (`cargo-fuzz`) | 0.3.x | — |
-| 4 | (M) Benchmarks vs libbz2, numbers in README | 0.3.x | — |
+| 4 | (M) Benchmarks vs libbz2, numbers in README | **shipped** (`main`) | — |
 | 5 | (M) Parallel block decode (`parallel` feature) | 0.4 | 1 |
 | 6 | (M) WASM wrapper crate + npm package | 0.4 | 1, 2 |
 | 7 | (M) Encoder — pure-Rust bzip2 compression | **shipped** (`main`) | 1 (conventions only) |
