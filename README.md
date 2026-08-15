@@ -12,9 +12,12 @@ project, open or closed, with no attribution obligation beyond the MIT notice.
 
 | Version | What it ships |
 |---|---|
-| **0.2** (now) | Own from-scratch, dependency-free streaming decoder. Verified byte-for-byte against `bzip2`. |
+| **0.3.0** (now) | The 0.2 decoder, verified to compile untouched for `wasm32-unknown-unknown`, plus the project [ROADMAP](ROADMAP.md). |
+| 0.3.x (roadmap) | Foundations: `no_std + alloc`, CI, `cargo-fuzz` targets, criterion benchmarks vs libbz2. |
+| 0.4 (roadmap) | `parallel` feature: rayon-backed parallel block decode with in-order reassembly (bzip2 blocks are independent, so they scale across cores) — and a `crabz2-wasm` npm package with a streaming JS API. |
+| 0.5 (roadmap) | Pure-Rust **encoder** — the piece the ecosystem lacks. See [ROADMAP](ROADMAP.md) for the design. |
+| 0.2 | Own from-scratch, dependency-free streaming decoder. Verified byte-for-byte against `bzip2`. |
 | 0.1 | Thin wrapper over `bzip2-rs` (superseded; `0.1.0` remains dual `MIT OR Apache-2.0`). |
-| 0.3 (roadmap) | `parallel` feature: rayon-backed parallel block decode with in-order reassembly. bzip2 blocks are independent, so they scale across cores. |
 
 ## Usage
 
