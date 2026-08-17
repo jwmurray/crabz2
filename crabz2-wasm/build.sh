@@ -29,6 +29,7 @@ const fs = require("fs");
 const path = process.argv[1];
 const pkg = JSON.parse(fs.readFileSync(path, "utf8"));
 pkg.name = "crabz2";
+pkg.repository = { type: "git", url: "git+https://github.com/jwmurray/crabz2.git" };
 pkg.homepage = "https://github.com/jwmurray/crabz2";
 pkg.keywords = ["bzip2", "bz2", "decompress", "wasm", "webassembly", "rust"];
 // npm ships a file named LICENSE without being asked; ours is LICENSE-MIT, so it
