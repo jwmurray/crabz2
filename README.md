@@ -20,12 +20,12 @@ the piece the ecosystem was missing.
 
 | Version | What it ships |
 |---|---|
-| **0.3.1** (now) | The 0.2 decoder, hardened against crafted RLE2 run lengths, with a `cargo-fuzz` target. See the [ROADMAP](ROADMAP.md). |
-| unreleased (`main`) | The decoder behind a sans-io state machine: `no_std + alloc` core, and `wasm32-unknown-unknown` plus a bare-metal target checked in CI. The [`crabz2-wasm`](crabz2-wasm/) wrapper and its browser demo build on that machine. Plus the pure-Rust **encoder** — `compress`, `Crabz2Writer`, levels 1–9 — verified against system `bzip2`, and the non-default `parallel` feature for multi-core decode. |
-| 0.3.x (roadmap) | Remaining foundation: criterion benchmarks vs libbz2. |
-| 0.4 (roadmap) | A `crabz2-wasm` npm package with a streaming JS API. |
+| **0.4.0** (now) | The full format in pure Rust. Pure-Rust **encoder** — `compress`, `Crabz2Writer`, levels 1–9, verified against system `bzip2`. Decoder behind a sans-io state machine: `no_std + alloc` core, `wasm32-unknown-unknown` and a bare-metal target checked in CI. Non-default `parallel` feature for multi-core decode. The [`crabz2-wasm`](crabz2-wasm/) npm package (`npm install crabz2`) with a streaming JS API and a [live browser demo](https://jwmurray.github.io/crabz2/). Criterion benchmarks vs libbz2 below. |
+| 0.3.1 | The 0.2 decoder, hardened against crafted RLE2 run lengths, with a `cargo-fuzz` target. |
 | 0.2 | Own from-scratch, dependency-free streaming decoder. Verified byte-for-byte against `bzip2`. |
 | 0.1 | Thin wrapper over `bzip2-rs` (superseded; `0.1.0` remains dual `MIT OR Apache-2.0`). |
+
+Next up: see the [ROADMAP](ROADMAP.md) — parallel *encode*, encoder profiling.
 
 ## Usage
 
@@ -168,6 +168,9 @@ encode by the level. CI checks
 `wasm32-unknown-unknown` and `thumbv7em-none-eabihf`, and the MSRV is 1.63.
 
 ## WASM / browser
+
+**Live demo: <https://jwmurray.github.io/crabz2/>** — drop a `.bz2` file, it
+decompresses client-side; nothing leaves the browser.
 
 [`crabz2-wasm/`](crabz2-wasm/) is a [wasm-bindgen](https://wasm-bindgen.github.io/wasm-bindgen/)
 wrapper — the same decoder, compiled to about 33 KB of WebAssembly and published to
