@@ -1,0 +1,38 @@
+name: pages
+
+# Build the browser demo (crabz2-wasm/www) and publish it to GitHub Pages.
+# The page imports ./pkg/crabz2.js, so the wasm build lands inside www/ and
+# the whole directory is the site.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add wasm32-unknown-unknown
+      - name: Install wasm-pack
+        run: curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+      - name: Build the demo's wasm module
+        run: ./crabz2-wasm/build.sh web www/pkg
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: crabz2-wasm/www
+      - id: deployment
+        uses: actions/deploy-pages@v4
