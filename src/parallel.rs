@@ -26,7 +26,7 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-#[cfg(not(feature = "forbid-unsafe"))]
+#[cfg(feature = "unsafe-fast")]
 use core::mem::MaybeUninit;
 use std::io;
 use std::sync::Mutex;
@@ -278,7 +278,7 @@ fn stitch(segments: Vec<Segment>) -> Vec<u8> {
     }
 
     // Carve the spare capacity into one disjoint `&mut` slice per segment.
-    #[cfg(not(feature = "forbid-unsafe"))]
+    #[cfg(feature = "unsafe-fast")]
     {
         let mut spare: &mut [MaybeUninit<u8>] = &mut out.spare_capacity_mut()[..total];
         let mut slots: Vec<&mut [MaybeUninit<u8>]> = Vec::with_capacity(segments.len());
@@ -303,7 +303,7 @@ fn stitch(segments: Vec<Segment>) -> Vec<u8> {
     }
     // Safe variant: zero-fill first (alloc_zeroed pages, nearly free), then carve
     // the initialized buffer into disjoint `&mut` slices — no uninitialized memory.
-    #[cfg(feature = "forbid-unsafe")]
+    #[cfg(not(feature = "unsafe-fast"))]
     {
         out.resize(total, 0);
         let mut spare: &mut [u8] = &mut out[..];

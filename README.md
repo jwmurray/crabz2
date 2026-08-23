@@ -27,7 +27,8 @@ the piece the ecosystem was missing.
 
 | Version | What it ships |
 |---|---|
-| **0.5.0** (now) | Decode hot path rewritten from profiling: write-only IBWT threading, interleaved pair walks (software-pipelined serially, paired speculation in parallel), fast-table Huffman over a 64-bit bit reservoir, arena MTF, cached thread pools, parallel output assembly. Decode now **beats C libbz2 single-threaded and lbzip2 in parallel at every benchmarked size**. |
+| **0.6.0** (now) | **Zero `unsafe` by default**, enforced by `#![forbid(unsafe_code)]`; the raw-pointer hot paths moved behind the non-default `unsafe-fast` feature after benchmarks showed the difference is within noise. |
+| 0.5.0 | Decode hot path rewritten from profiling: write-only IBWT threading, interleaved pair walks (software-pipelined serially, paired speculation in parallel), fast-table Huffman over a 64-bit bit reservoir, arena MTF, cached thread pools, parallel output assembly. Decode now **beats C libbz2 single-threaded and lbzip2 in parallel at every benchmarked size**. |
 | 0.4.0 | The full format in pure Rust. Pure-Rust **encoder** — `compress`, `Crabz2Writer`, levels 1–9, verified against system `bzip2`. Decoder behind a sans-io state machine: `no_std + alloc` core, `wasm32-unknown-unknown` and a bare-metal target checked in CI. Non-default `parallel` feature for multi-core decode. The [`crabz2-wasm`](crabz2-wasm/) npm package (`npm install crabz2`) with a streaming JS API and a [live browser demo](https://jwmurray.github.io/crabz2/). Criterion benchmarks vs libbz2 below. |
 | 0.3.1 | The 0.2 decoder, hardened against crafted RLE2 run lengths, with a `cargo-fuzz` target. |
 | 0.2 | Own from-scratch, dependency-free streaming decoder. Verified byte-for-byte against `bzip2`. |
@@ -162,38 +163,38 @@ See `scripts/run_bench_multi.sh` for how the measurements were collected.
 **Not offered on wasm.** `parallel` needs OS threads; enabling it for a `wasm` target
 is a `compile_error!` rather than a runtime surprise.
 
-## Zero-`unsafe` build (`forbid-unsafe`)
+## Zero `unsafe` by default (and the `unsafe-fast` switch)
 
-The decoder's hot paths use `unsafe` in three places: the IBWT threading pass
-(uninitialized successor vector, unchecked scatter writes), the permutation walk
-(unchecked `tt` reads, a raw output write cursor), and the parallel output assembly
-(disjoint copies into spare capacity). The non-default `forbid-unsafe` feature swaps
-all three for fully safe equivalents — same output, same errors — and turns on
-`#![forbid(unsafe_code)]`, so the compiler **proves** the build contains no `unsafe`
-at all (this is Rust's answer to a C `#ifdef` build variant: `#[cfg(feature = …)]`
-conditional compilation, with the guarantee machine-checked instead of by
-convention):
+**The default build contains no `unsafe` code at all**, and the compiler proves it:
+`#![forbid(unsafe_code)]` is active whenever the non-default `unsafe-fast` feature
+is off, so a stray `unsafe` block is a compile error, not a convention. The decoder's
+three hot paths — the IBWT threading pass, the permutation walk, and the parallel
+output assembly — have raw-pointer variants behind `unsafe-fast` (this is Rust's
+answer to a C `#ifdef` build variant: `#[cfg(feature = …)]` conditional
+compilation, with the guarantee machine-checked):
 
 ```toml
-crabz2 = { version = "0.5", features = ["forbid-unsafe"] }
+crabz2 = { version = "0.6" }                              # zero unsafe, default
+crabz2 = { version = "0.6", features = ["unsafe-fast"] }  # raw-pointer hot paths
 ```
 
-**Measured cost: nothing outside noise.** On the multi-bench corpus and a
+**Measured difference: nothing outside noise.** On the multi-bench corpus and a
 word-salad corpus (Apple M5 Max, median of 5, both builds run back-to-back):
 
-| Metric | unsafe (default) | `forbid-unsafe` |
+| Metric | safe (default) | `unsafe-fast` |
 |---|---:|---:|
-| serial, repetitive 100 MB | 406 MB/s | 410 MB/s |
-| parallel(8), repetitive 100 MB | 2168 MB/s | 2235 MB/s |
-| serial, word-salad 100 MB | 104 MB/s | 106 MB/s |
-| parallel(8), word-salad 100 MB | 318 MB/s | 301 MB/s |
+| serial, repetitive 100 MB | 410 MB/s | 406 MB/s |
+| parallel(8), repetitive 100 MB | 2235 MB/s | 2168 MB/s |
+| serial, word-salad 100 MB | 106 MB/s | 104 MB/s |
+| parallel(8), word-salad 100 MB | 301 MB/s | 318 MB/s |
 
 The hot loops are memory-latency- and bandwidth-bound, so bounds-check branches
 predict perfectly and hide under the dependent-load chains; the zero-fill that
 replaces the uninitialized buffer streams at memory bandwidth. The `unsafe` paths
 date from when the loops were compute-bound; after the hot-path restructuring they
-buy roughly nothing on this hardware — the feature exists so you can have the
-compiler-enforced guarantee and measure the trade on yours.
+buy roughly nothing on this hardware — the switch exists so the trade can be
+measured on other hardware rather than taken on faith. Both configurations are
+tested and linted in CI and produce byte-identical output.
 
 ## `no_std`
 
