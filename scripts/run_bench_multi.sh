@@ -10,7 +10,7 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_DIR"
 
 OUT=bench_multi.csv
-echo "input_mb,crabz2_mb_s,libbz2_mb_s,bzip2_mb_s,parallel_bzip2_mb_s,parallel_cmd,threads" > "$OUT"
+echo "input_mb,crabz2_mb_s,libbz2_mb_s,bzip2_mb_s,parallel_bzip2_mb_s,parallel_cmd,threads,plain_bytes,num_blocks" > "$OUT"
 
 THREADS=8
 ITERS=3
@@ -28,10 +28,11 @@ elif [ -n "$LBZIP" ]; then
   PAR_TYPE="lbzip2"
 fi
 
+TMPDIR_BENCH=$(mktemp -d)
 for sz in 1 5 10 50 100; do
   echo "Running ${sz} MB test..."
-  PLAIN=/tmp/crabz2_plain_${sz}.dat
-  BZ=/tmp/crabz2_test_${sz}.bz2
+  PLAIN="$TMPDIR_BENCH/crabz2_plain_${sz}.dat"
+  BZ="$TMPDIR_BENCH/crabz2_test_${sz}.bz2"
 
   # generate plaintext
   python3 - <<PY > "$PLAIN"
@@ -69,15 +70,18 @@ PY
     exit 1
   fi
 
-  # Measure system bzip2 (native C) decompression MB/s using Python timing.
+  # Measure system bzip2 (native C) decompression MB/s using Python timing (median of ITERS).
   echo "  running system bzip2 (single-thread)..."
   python3 - <<PY > /tmp/bzip2_time.txt 2>/dev/null
-import time, subprocess
+import time, subprocess, statistics
 cmd = ["bzip2", "-dc", "$BZ"]
-start = time.time()
-subprocess.check_call(cmd, stdout=subprocess.DEVNULL)
-end = time.time()
-print(end-start)
+times = []
+for i in range($ITERS):
+    start = time.time()
+    subprocess.check_call(cmd, stdout=subprocess.DEVNULL)
+    end = time.time()
+    times.append(end-start)
+print(statistics.median(times))
 PY
   bzip2_real=$(cat /tmp/bzip2_time.txt)
   if [ -z "$bzip2_real" ] || awk "BEGIN{print ($bzip2_real<=0)}" | grep -q 1; then
@@ -86,27 +90,33 @@ PY
   plain_size=$(stat -f%z "$PLAIN")
   bzip2_mbs=$(awk -v b="$plain_size" -v s="$bzip2_real" 'BEGIN{printf "%.1f", (b/1e6)/s}')
 
-  # Measure parallel pbzip2/lbzip2 if available
+  # Measure parallel pbzip2/lbzip2 if available (median of ITERS).
   par_mbs=""
   if [ -n "$PAR_CMD" ]; then
     echo "  running $PAR_CMD - threads=$THREADS..."
     if [ "$PAR_TYPE" = "pbzip2" ]; then
       python3 - <<PY > /tmp/parallel_time.txt 2>/dev/null
-import time, subprocess
+import time, subprocess, statistics
 cmd = ["$PAR_CMD", "-dc", "-p", str($THREADS), "$BZ"]
-start = time.time()
-subprocess.check_call(cmd, stdout=subprocess.DEVNULL)
-end = time.time()
-print(end-start)
+times = []
+for i in range($ITERS):
+    start = time.time()
+    subprocess.check_call(cmd, stdout=subprocess.DEVNULL)
+    end = time.time()
+    times.append(end-start)
+print(statistics.median(times))
 PY
     else
       python3 - <<PY > /tmp/parallel_time.txt 2>/dev/null
-import time, subprocess
+import time, subprocess, statistics
 cmd = ["$PAR_CMD", "-dc", "-n", str($THREADS), "$BZ"]
-start = time.time()
-subprocess.check_call(cmd, stdout=subprocess.DEVNULL)
-end = time.time()
-print(end-start)
+times = []
+for i in range($ITERS):
+    start = time.time()
+    subprocess.check_call(cmd, stdout=subprocess.DEVNULL)
+    end = time.time()
+    times.append(end-start)
+print(statistics.median(times))
 PY
     fi
     par_real=$(cat /tmp/parallel_time.txt)
@@ -116,7 +126,24 @@ PY
     par_mbs=$(awk -v b="$plain_size" -v s="$par_real" 'BEGIN{printf "%.1f", (b/1e6)/s}')
   fi
 
-  echo "${sz},${crab_mbs},${lib_mbs},${bzip2_mbs},${par_mbs},${PAR_CMD},${THREADS}" >> "$OUT"
+  # Compute block size (100k units) and number of blocks used by the compressor.
+  block100k=$(python3 - <<PY
+with open("$BZ","rb") as f:
+    h=f.read(4)
+    if len(h)>=4:
+        bs = h[3] - ord('0')
+    else:
+        bs = 9
+    print(bs)
+PY
+)
+  if [ -z "$block100k" ] || ! echo "$block100k" | grep -qE '^[0-9]+$'; then
+    block100k=9
+  fi
+  block_bytes=$((block100k * 100000))
+  num_blocks=$(( (plain_size + block_bytes - 1) / block_bytes ))
+
+  echo "${sz},${crab_mbs},${lib_mbs},${bzip2_mbs},${par_mbs},${PAR_CMD},${THREADS},${plain_size},${num_blocks}" >> "$OUT"
 
   # Print comparative summary for this size.
   if [ -n "$par_mbs" ]; then
@@ -129,6 +156,7 @@ PY
 
   rm -f "$COMP_OUT"
 done
+rm -rf "$TMPDIR_BENCH"
 
 echo "Wrote $OUT"
 cat "$OUT"

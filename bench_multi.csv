@@ -1,6 +1,6 @@
-input_mb,crabz2_mb_s,libbz2_mb_s,bzip2_mb_s,parallel_bzip2_mb_s,parallel_cmd,threads
-1,195.1,229.7,144.5,112.1,/opt/homebrew/bin/lbzip2,8
-5,1007.1,312.5,264.2,711.1,/opt/homebrew/bin/lbzip2,8
-10,1183.5,323.1,311.5,955.4,/opt/homebrew/bin/lbzip2,8
-50,1643.6,339.6,331.6,1854.6,/opt/homebrew/bin/lbzip2,8
-100,1719.5,336.2,346.5,1868.0,/opt/homebrew/bin/lbzip2,8
+input_mb,crabz2_mb_s,libbz2_mb_s,bzip2_mb_s,parallel_bzip2_mb_s,parallel_cmd,threads,plain_bytes,num_blocks
+1,217.9,233.9,146.6,140.4,/opt/homebrew/bin/lbzip2,8,1000000,2
+5,949.6,283.8,277.2,718.4,/opt/homebrew/bin/lbzip2,8,5000000,6
+10,1097.9,309.6,295.8,894.2,/opt/homebrew/bin/lbzip2,8,10000000,12
+50,1540.7,326.6,335.7,1718.6,/opt/homebrew/bin/lbzip2,8,50000000,56
+100,1635.0,332.8,340.3,1904.8,/opt/homebrew/bin/lbzip2,8,100000000,112
