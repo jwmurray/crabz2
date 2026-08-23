@@ -1167,14 +1167,14 @@ pub(crate) fn decompress_to_vec_with(
                         tmp.clear();
                         let (ca, cb) = walk_pair(
                             WalkCursor::begin(&a.tt, orig_ptr, &mut out),
-                            WalkCursor::begin(&b.tt, ptr_b, &mut tmp),
+                            WalkCursor::begin(&b.tt, ptr_b, tmp),
                         );
                         if ca != block_crc {
                             return Err(Error::CrcMismatch);
                         }
                         a.combined_crc = a.combined_crc.rotate_left(1) ^ block_crc;
                         if cb == crc_b {
-                            out.extend_from_slice(&tmp);
+                            out.extend_from_slice(tmp);
                             a.combined_crc = a.combined_crc.rotate_left(1) ^ crc_b;
                             a.bit = end_b;
                         }
