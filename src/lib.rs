@@ -62,6 +62,11 @@
 //! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
+// The `forbid-unsafe` feature swaps every unsafe hot path for a fully safe
+// equivalent (same output, same errors — only slower), and this attribute makes
+// the compiler *prove* it: a build with the feature on fails if any `unsafe`
+// remains reachable.
+#![cfg_attr(feature = "forbid-unsafe", forbid(unsafe_code))]
 
 // A thread pool needs threads. Rather than let `parallel` compile to something that
 // panics or silently runs serially in a browser, refuse the combination outright.
@@ -76,6 +81,7 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
+#[cfg(not(feature = "forbid-unsafe"))]
 use core::ptr;
 
 #[cfg(feature = "std")]
@@ -969,12 +975,13 @@ impl BlockDecoder {
         // that position's byte), but this pass only *writes* the scattered lines and
         // reads the dense byte buffer sequentially.
         self.tt.clear();
-        self.tt.reserve(nblock);
         // Safety: every cell in `0..nblock` is written exactly once below — `cftab`
         // partitions `0..nblock` into per-byte ranges and each write consumes one
         // slot — and nothing reads `tt` until after this loop.
+        #[cfg(not(feature = "forbid-unsafe"))]
         #[allow(clippy::uninit_vec)]
         unsafe {
+            self.tt.reserve(nblock);
             self.tt.set_len(nblock);
             let bp = self.bytes.as_ptr();
             let tp = self.tt.as_mut_ptr();
@@ -983,6 +990,16 @@ impl BlockDecoder {
                 let idx = *cftab.get_unchecked(b) as usize;
                 *cftab.get_unchecked_mut(b) = (idx + 1) as u32;
                 *tp.add(idx) = ((i as u32) << 8) | b as u32;
+            }
+        }
+        #[cfg(feature = "forbid-unsafe")]
+        {
+            self.tt.resize(nblock, 0);
+            for (i, &byte) in self.bytes.iter().enumerate() {
+                let b = byte as usize;
+                let idx = cftab[b] as usize;
+                cftab[b] += 1;
+                self.tt[idx] = ((i as u32) << 8) | b as u32;
             }
         }
 
@@ -1003,6 +1020,7 @@ impl BlockDecoder {
 ///
 /// [`step`](WalkCursor::step) must be called at most [`WalkCursor::rem`] times; state
 /// is committed back to the `Vec` by [`finish`](WalkCursor::finish).
+#[cfg(not(feature = "forbid-unsafe"))]
 struct WalkCursor<'a> {
     tt: *const u32,
     /// Cells hold `(next_pos << 8) | byte_of_next_pos`, so one load per step yields
@@ -1022,6 +1040,7 @@ struct WalkCursor<'a> {
     room: usize,
 }
 
+#[cfg(not(feature = "forbid-unsafe"))]
 impl<'a> WalkCursor<'a> {
     fn begin(tt: &[u32], orig_ptr: usize, out: &'a mut Vec<u8>) -> WalkCursor<'a> {
         let len = out.len();
@@ -1110,6 +1129,7 @@ impl<'a> WalkCursor<'a> {
 
 /// Walk two prepared blocks with their steps interleaved, so the two serial
 /// dependent-load chains overlap in the memory system. Returns both block CRCs.
+#[cfg(not(feature = "forbid-unsafe"))]
 fn walk_pair(mut a: WalkCursor<'_>, mut b: WalkCursor<'_>) -> (u32, u32) {
     unsafe {
         while a.rem > 0 && b.rem > 0 {
@@ -1121,6 +1141,91 @@ fn walk_pair(mut a: WalkCursor<'_>, mut b: WalkCursor<'_>) -> (u32, u32) {
             a.rem -= chunk;
             b.rem -= chunk;
         }
+    }
+    (a.finish(), b.finish())
+}
+
+/// Fully safe walk: identical output and CRC, but every `tt` read is bounds-checked
+/// and output goes through `push`/`resize` instead of a raw write cursor.
+#[cfg(feature = "forbid-unsafe")]
+struct WalkCursor<'a> {
+    tt: &'a [u32],
+    /// Cells hold `(next_pos << 8) | byte_of_next_pos`, so one load per step yields
+    /// both the byte to emit and where to go next.
+    t_pos: u32,
+    prev: i32,
+    count: u32,
+    crc: u32,
+    /// Steps left; one step per `tt` cell.
+    rem: usize,
+    out: &'a mut Vec<u8>,
+}
+
+#[cfg(feature = "forbid-unsafe")]
+impl<'a> WalkCursor<'a> {
+    fn begin(tt: &'a [u32], orig_ptr: usize, out: &'a mut Vec<u8>) -> WalkCursor<'a> {
+        WalkCursor {
+            t_pos: tt[orig_ptr],
+            tt,
+            prev: -1,
+            count: 0,
+            crc: 0xFFFF_FFFF,
+            rem: tt.len(),
+            out,
+        }
+    }
+
+    #[inline(always)]
+    fn step(&mut self) {
+        let b = (self.t_pos & 0xff) as u8;
+        self.t_pos = self.tt[(self.t_pos >> 8) as usize];
+
+        if self.count == 4 {
+            // `b` is the count of extra repeats beyond the four literals.
+            let v = self.prev as u8;
+            self.out.resize(self.out.len() + b as usize, v);
+            for _ in 0..b {
+                self.crc = crc_update(self.crc, v);
+            }
+            self.count = 0;
+            self.prev = -1;
+        } else {
+            self.out.push(b);
+            self.crc = crc_update(self.crc, b);
+            if b as i32 == self.prev {
+                self.count += 1;
+            } else {
+                self.prev = b as i32;
+                self.count = 1;
+            }
+        }
+    }
+
+    /// Run the remaining steps and return the block CRC.
+    fn finish(mut self) -> u32 {
+        #[cfg(feature = "phasetime")]
+        let mut _pt = phasetime::Scope::new();
+        self.out.reserve(self.rem);
+        while self.rem > 0 {
+            self.step();
+            self.rem -= 1;
+        }
+        #[cfg(feature = "phasetime")]
+        _pt.lap(3); // permutation walk + RLE1 + CRC
+        !self.crc
+    }
+}
+
+/// Safe interleaved pair walk: same chain overlap, checked indexing.
+#[cfg(feature = "forbid-unsafe")]
+fn walk_pair(mut a: WalkCursor<'_>, mut b: WalkCursor<'_>) -> (u32, u32) {
+    a.out.reserve(a.rem);
+    b.out.reserve(b.rem);
+    while a.rem > 0 && b.rem > 0 {
+        a.step();
+        b.step();
+        a.rem -= 1;
+        b.rem -= 1;
     }
     (a.finish(), b.finish())
 }

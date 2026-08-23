@@ -162,6 +162,39 @@ See `scripts/run_bench_multi.sh` for how the measurements were collected.
 **Not offered on wasm.** `parallel` needs OS threads; enabling it for a `wasm` target
 is a `compile_error!` rather than a runtime surprise.
 
+## Zero-`unsafe` build (`forbid-unsafe`)
+
+The decoder's hot paths use `unsafe` in three places: the IBWT threading pass
+(uninitialized successor vector, unchecked scatter writes), the permutation walk
+(unchecked `tt` reads, a raw output write cursor), and the parallel output assembly
+(disjoint copies into spare capacity). The non-default `forbid-unsafe` feature swaps
+all three for fully safe equivalents — same output, same errors — and turns on
+`#![forbid(unsafe_code)]`, so the compiler **proves** the build contains no `unsafe`
+at all (this is Rust's answer to a C `#ifdef` build variant: `#[cfg(feature = …)]`
+conditional compilation, with the guarantee machine-checked instead of by
+convention):
+
+```toml
+crabz2 = { version = "0.5", features = ["forbid-unsafe"] }
+```
+
+**Measured cost: nothing outside noise.** On the multi-bench corpus and a
+word-salad corpus (Apple M5 Max, median of 5, both builds run back-to-back):
+
+| Metric | unsafe (default) | `forbid-unsafe` |
+|---|---:|---:|
+| serial, repetitive 100 MB | 406 MB/s | 410 MB/s |
+| parallel(8), repetitive 100 MB | 2168 MB/s | 2235 MB/s |
+| serial, word-salad 100 MB | 104 MB/s | 106 MB/s |
+| parallel(8), word-salad 100 MB | 318 MB/s | 301 MB/s |
+
+The hot loops are memory-latency- and bandwidth-bound, so bounds-check branches
+predict perfectly and hide under the dependent-load chains; the zero-fill that
+replaces the uninitialized buffer streams at memory bandwidth. The `unsafe` paths
+date from when the loops were compute-bound; after the hot-path restructuring they
+buy roughly nothing on this hardware — the feature exists so you can have the
+compiler-enforced guarantee and measure the trade on yours.
+
 ## `no_std`
 
 Both halves are sans-io: the decoder is a state machine over `&[u8]` and a bit cursor,
