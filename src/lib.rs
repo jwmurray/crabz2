@@ -579,6 +579,8 @@ impl BlockDecoder {
 
         // MTF + RLE2 decode into the BWT input buffer `tt` (byte in low 8 bits).
         self.tt.clear();
+        // Avoid reallocations for the common case by reserving the declared block size.
+        self.tt.reserve(self.block_size);
         let mut cftab = [0u32; 257];
         let mut mtf = seq_to_unseq.clone();
         let mut sel_idx = 0usize;
@@ -661,11 +663,18 @@ impl BlockDecoder {
 
         // Inverse Burrows–Wheeler transform (fast form): thread the source index
         // into the high bits of each `tt` cell, then walk from `orig_ptr`.
-        for i in 0..nblock {
-            let b = (self.tt[i] & 0xff) as usize;
-            let idx = cftab[b] as usize;
-            self.tt[idx] |= (i as u32) << 8;
-            cftab[b] += 1;
+        // Thread the source index into the high bits of each `tt` cell.
+        // Use unchecked indexing in this hot loop to eliminate bounds checks
+        // — correctness is guaranteed by the cftab computation above.
+        unsafe {
+            let tt_ptr = self.tt.as_mut_ptr();
+            for i in 0..nblock {
+                let b = (*tt_ptr.add(i) & 0xff) as usize;
+                let idx = cftab[b] as usize;
+                let val = *tt_ptr.add(idx) | ((i as u32) << 8);
+                *tt_ptr.add(idx) = val;
+                cftab[b] += 1;
+            }
         }
 
         // Walk the permutation, applying RLE1 and CRC to produce the plaintext block.
@@ -675,27 +684,32 @@ impl BlockDecoder {
         let mut t_pos = self.tt[orig_ptr] >> 8;
         let mut prev: i32 = -1;
         let mut count: u32 = 0;
-        for _ in 0..nblock {
-            t_pos = self.tt[t_pos as usize];
-            let b = (t_pos & 0xff) as u8;
-            t_pos >>= 8;
+        // Walk the permutation, applying RLE1 and CRC to produce the plaintext block.
+        // Use unchecked reads from `tt` to avoid per-iteration bounds checks.
+        unsafe {
+            let tt_ptr = self.tt.as_ptr();
+            for _ in 0..nblock {
+                t_pos = *tt_ptr.add(t_pos as usize);
+                let b = (t_pos & 0xff) as u8;
+                t_pos >>= 8;
 
-            if count == 4 {
-                // `b` is the count of extra repeats beyond the four literals.
-                for _ in 0..b {
-                    out.push(prev as u8);
-                    crc = crc_update(crc, prev as u8);
-                }
-                count = 0;
-                prev = -1;
-            } else {
-                out.push(b);
-                crc = crc_update(crc, b);
-                if b as i32 == prev {
-                    count += 1;
+                if count == 4 {
+                    // `b` is the count of extra repeats beyond the four literals.
+                    for _ in 0..b {
+                        out.push(prev as u8);
+                        crc = crc_update(crc, prev as u8);
+                    }
+                    count = 0;
+                    prev = -1;
                 } else {
-                    prev = b as i32;
-                    count = 1;
+                    out.push(b);
+                    crc = crc_update(crc, b);
+                    if b as i32 == prev {
+                        count += 1;
+                    } else {
+                        prev = b as i32;
+                        count = 1;
+                    }
                 }
             }
         }
