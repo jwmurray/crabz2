@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="500" viewBox="0 0 900 500" role="img" aria-label="Grouped bar chart: crabz2 decompresses faster than libbz2, system bzip2, and lbzip2 at every input size from 1 to 100 MB.">
+<rect width="900" height="500" rx="10" fill="#fcfcfb"/>
+<text x="36" y="40" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" font-weight="700" fill="#0b0b0b">bzip2 decompression throughput — crabz2 vs the C implementations</text>
+<text x="36" y="62" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#52514e">MB/s of plaintext out (higher is better) &#183; Apple M5 Max &#183; scripts/run_bench_multi.sh, median of 5 runs</text>
+<rect x="36" y="80" width="12" height="12" rx="3" fill="#2a78d6"/>
+<text x="53" y="90.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#52514e">crabz2 (Rust, 8 threads)</text>
+<rect x="230.60000000000002" y="80" width="12" height="12" rx="3" fill="#eb6834"/>
+<text x="247.60000000000002" y="90.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#52514e">libbz2 (C, bzip2 crate)</text>
+<rect x="418.80000000000007" y="80" width="12" height="12" rx="3" fill="#1baf7a"/>
+<text x="435.80000000000007" y="90.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#52514e">bzip2 (C, system)</text>
+<rect x="568.6000000000001" y="80" width="12" height="12" rx="3" fill="#eda100"/>
+<text x="585.6000000000001" y="90.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#52514e">lbzip2 -n8 (C, parallel)</text>
+<line x1="74" y1="428.0" x2="884" y2="428.0" stroke="#e8e7e2" stroke-width="1"/>
+<text x="66" y="432.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8a887f" text-anchor="end">0</text>
+<line x1="74" y1="376.3" x2="884" y2="376.3" stroke="#e8e7e2" stroke-width="1"/>
+<text x="66" y="380.3" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8a887f" text-anchor="end">400</text>
+<line x1="74" y1="324.7" x2="884" y2="324.7" stroke="#e8e7e2" stroke-width="1"/>
+<text x="66" y="328.7" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8a887f" text-anchor="end">800</text>
+<line x1="74" y1="273.0" x2="884" y2="273.0" stroke="#e8e7e2" stroke-width="1"/>
+<text x="66" y="277.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8a887f" text-anchor="end">1,200</text>
+<line x1="74" y1="221.3" x2="884" y2="221.3" stroke="#e8e7e2" stroke-width="1"/>
+<text x="66" y="225.3" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8a887f" text-anchor="end">1,600</text>
+<line x1="74" y1="169.7" x2="884" y2="169.7" stroke="#e8e7e2" stroke-width="1"/>
+<text x="66" y="173.7" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8a887f" text-anchor="end">2,000</text>
+<line x1="74" y1="118.0" x2="884" y2="118.0" stroke="#e8e7e2" stroke-width="1"/>
+<text x="66" y="122.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8a887f" text-anchor="end">2,400</text>
+<path d="M92.0,428.0 V399.1 Q92.0,395.1 96.0,395.1 H118.0 Q122.0,395.1 122.0,399.1 V428.0 Z" fill="#2a78d6"/>
+<text x="107.0" y="388.1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="650" fill="#0b0b0b" text-anchor="middle">255</text>
+<path d="M124.0,428.0 V401.2 Q124.0,397.2 128.0,397.2 H150.0 Q154.0,397.2 154.0,401.2 V428.0 Z" fill="#eb6834"/>
+<path d="M156.0,428.0 V410.3 Q156.0,406.3 160.0,406.3 H182.0 Q186.0,406.3 186.0,410.3 V428.0 Z" fill="#1baf7a"/>
+<path d="M188.0,428.0 V406.4 Q188.0,402.4 192.0,402.4 H214.0 Q218.0,402.4 218.0,406.4 V428.0 Z" fill="#eda100"/>
+<text x="155.0" y="450.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#52514e" text-anchor="middle">1 MB</text>
+<path d="M254.0,428.0 V272.6 Q254.0,268.6 258.0,268.6 H280.0 Q284.0,268.6 284.0,272.6 V428.0 Z" fill="#2a78d6"/>
+<text x="269.0" y="261.6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="650" fill="#0b0b0b" text-anchor="middle">1,234</text>
+<path d="M286.0,428.0 V388.8 Q286.0,384.8 290.0,384.8 H312.0 Q316.0,384.8 316.0,388.8 V428.0 Z" fill="#eb6834"/>
+<path d="M318.0,428.0 V394.7 Q318.0,390.7 322.0,390.7 H344.0 Q348.0,390.7 348.0,394.7 V428.0 Z" fill="#1baf7a"/>
+<path d="M350.0,428.0 V332.3 Q350.0,328.3 354.0,328.3 H376.0 Q380.0,328.3 380.0,332.3 V428.0 Z" fill="#eda100"/>
+<text x="317.0" y="450.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#52514e" text-anchor="middle">5 MB</text>
+<path d="M416.0,428.0 V242.2 Q416.0,238.2 420.0,238.2 H442.0 Q446.0,238.2 446.0,242.2 V428.0 Z" fill="#2a78d6"/>
+<text x="431.0" y="231.2" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="650" fill="#0b0b0b" text-anchor="middle">1,470</text>
+<path d="M448.0,428.0 V388.3 Q448.0,384.3 452.0,384.3 H474.0 Q478.0,384.3 478.0,388.3 V428.0 Z" fill="#eb6834"/>
+<path d="M480.0,428.0 V392.7 Q480.0,388.7 484.0,388.7 H506.0 Q510.0,388.7 510.0,392.7 V428.0 Z" fill="#1baf7a"/>
+<path d="M512.0,428.0 V299.9 Q512.0,295.9 516.0,295.9 H538.0 Q542.0,295.9 542.0,299.9 V428.0 Z" fill="#eda100"/>
+<text x="479.0" y="450.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#52514e" text-anchor="middle">10 MB</text>
+<path d="M578.0,428.0 V172.3 Q578.0,168.3 582.0,168.3 H604.0 Q608.0,168.3 608.0,172.3 V428.0 Z" fill="#2a78d6"/>
+<text x="593.0" y="161.3" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="650" fill="#0b0b0b" text-anchor="middle">2,011</text>
+<path d="M610.0,428.0 V389.3 Q610.0,385.3 614.0,385.3 H636.0 Q640.0,385.3 640.0,389.3 V428.0 Z" fill="#eb6834"/>
+<path d="M642.0,428.0 V388.5 Q642.0,384.5 646.0,384.5 H668.0 Q672.0,384.5 672.0,388.5 V428.0 Z" fill="#1baf7a"/>
+<path d="M674.0,428.0 V205.2 Q674.0,201.2 678.0,201.2 H700.0 Q704.0,201.2 704.0,205.2 V428.0 Z" fill="#eda100"/>
+<text x="641.0" y="450.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#52514e" text-anchor="middle">50 MB</text>
+<path d="M740.0,428.0 V142.9 Q740.0,138.9 744.0,138.9 H766.0 Q770.0,138.9 770.0,142.9 V428.0 Z" fill="#2a78d6"/>
+<text x="755.0" y="131.9" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="650" fill="#0b0b0b" text-anchor="middle">2,238</text>
+<path d="M772.0,428.0 V388.5 Q772.0,384.5 776.0,384.5 H798.0 Q802.0,384.5 802.0,388.5 V428.0 Z" fill="#eb6834"/>
+<path d="M804.0,428.0 V387.7 Q804.0,383.7 808.0,383.7 H830.0 Q834.0,383.7 834.0,387.7 V428.0 Z" fill="#1baf7a"/>
+<path d="M836.0,428.0 V179.3 Q836.0,175.3 840.0,175.3 H862.0 Q866.0,175.3 866.0,179.3 V428.0 Z" fill="#eda100"/>
+<text x="803.0" y="450.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#52514e" text-anchor="middle">100 MB</text>
+<line x1="74" y1="428" x2="884" y2="428" stroke="#8a887f" stroke-width="1"/>
+<text x="36" y="480" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8a887f">Decoding bzip2 -9 output from memory. crabz2: decompress_parallel(8). libbz2 1.0.8 via the bzip2 crate, single thread. Exact figures in bench_multi.csv.</text>
+</svg>
