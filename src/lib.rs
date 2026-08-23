@@ -228,45 +228,6 @@ fn crc_update(crc: u32, byte: u8) -> u32 {
     (crc << 8) ^ CRC_TABLE[(((crc >> 24) ^ byte as u32) & 0xff) as usize]
 }
 
-/// Slicing-by-8 tables: `CRC_TABLES[0]` is `CRC_TABLE`, and `CRC_TABLES[k]` maps a
-/// byte to its CRC contribution from `k` positions earlier in an 8-byte word.
-const CRC_TABLES: [[u32; 256]; 8] = {
-    let mut tables = [[0u32; 256]; 8];
-    tables[0] = CRC_TABLE;
-    let mut k = 1;
-    while k < 8 {
-        let mut n = 0;
-        while n < 256 {
-            let prev = tables[k - 1][n];
-            tables[k][n] = (prev << 8) ^ CRC_TABLE[(prev >> 24) as usize];
-            n += 1;
-        }
-        k += 1;
-    }
-    tables
-};
-
-/// CRC-32/BZIP2 over a whole buffer, slicing-by-8. Bitwise-identical to folding
-/// every byte through [`crc_update`], but the dependent chain advances eight bytes
-/// per step instead of one.
-fn crc_buffer(mut crc: u32, data: &[u8]) -> u32 {
-    let mut chunks = data.chunks_exact(8);
-    for w in &mut chunks {
-        crc = CRC_TABLES[7][(w[0] ^ (crc >> 24) as u8) as usize]
-            ^ CRC_TABLES[6][(w[1] ^ (crc >> 16) as u8) as usize]
-            ^ CRC_TABLES[5][(w[2] ^ (crc >> 8) as u8) as usize]
-            ^ CRC_TABLES[4][(w[3] ^ crc as u8) as usize]
-            ^ CRC_TABLES[3][w[4] as usize]
-            ^ CRC_TABLES[2][w[5] as usize]
-            ^ CRC_TABLES[1][w[6] as usize]
-            ^ CRC_TABLES[0][w[7] as usize];
-    }
-    for &b in chunks.remainder() {
-        crc = crc_update(crc, b);
-    }
-    crc
-}
-
 /// MSB-first bit cursor over a caller-owned slice. Holds no io type and no buffer:
 /// the position is an absolute bit index, so a caller can retry a failed read after
 /// appending bytes simply by rebuilding the cursor at the last committed position.
