@@ -1,10 +1,10 @@
 [package]
 name = "crabz2"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.63"
 license = "MIT"
-description = "Pure-Rust bzip2 compression and decompression — no C, no libbz2, no third-party bzip2 crate — with a decoder that beats C libbz2 (and parallel lbzip2) in our benchmarks."
+description = "Pure-Rust bzip2 compression and decompression — no C, no libbz2, zero unsafe code by default — with a decoder that beats C libbz2 (and parallel lbzip2) in our benchmarks."
 repository = "https://github.com/jwmurray/crabz2"
 homepage = "https://github.com/jwmurray/crabz2"
 readme = "README.md"
@@ -68,11 +68,12 @@ libbz2 = ["bzip2"]
 # Dev-only: per-phase timers inside `decode_block` (Phase A profiling). Never default.
 phasetime = ["std"]
 
-# Compile the decoder with zero `unsafe` — the hot paths (IBWT threading, the
-# permutation walk, parallel output assembly) swap to fully safe equivalents with
-# identical output and errors, and `#![forbid(unsafe_code)]` makes the compiler
-# prove no unsafe remains. Costs speed; see the README for measurements.
-forbid-unsafe = []
+# The default build is zero-`unsafe`, enforced by `#![forbid(unsafe_code)]`. This
+# feature opts the hot paths (IBWT threading, the permutation walk, parallel output
+# assembly) back into their raw-pointer variants — identical output and errors; on
+# the benchmarked Apple Silicon hardware the speed difference is within noise (see
+# the README), so reach for this only after measuring on yours.
+unsafe-fast = []
 
 # The examples are std-only CLIs; skip them under --no-default-features.
 [[example]]
