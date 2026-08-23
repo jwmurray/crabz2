@@ -139,11 +139,11 @@ The `scripts/run_bench_multi.sh` script writes a CSV named [bench_multi.csv](ben
 
 | Input MB | crabz2 MB/s | libbz2 MB/s | bzip2 MB/s | parallel MB/s | parallel cmd | threads |
 |---:|---:|---:|---:|---:|---|---:|
-| 1 | 195.1 | 229.7 | 144.5 | 112.1 | /opt/homebrew/bin/lbzip2 | 8 |
-| 5 | 1007.1 | 312.5 | 264.2 | 711.1 | /opt/homebrew/bin/lbzip2 | 8 |
-| 10 | 1183.5 | 323.1 | 311.5 | 955.4 | /opt/homebrew/bin/lbzip2 | 8 |
-| 50 | 1643.6 | 339.6 | 331.6 | 1854.6 | /opt/homebrew/bin/lbzip2 | 8 |
-| 100 | 1719.5 | 336.2 | 346.5 | 1868.0 | /opt/homebrew/bin/lbzip2 | 8 |
+| 1 | 254.7 | 238.2 | 167.8 | 197.9 | /opt/homebrew/bin/lbzip2 | 8 |
+| 5 | 1234.4 | 334.6 | 288.6 | 771.6 | /opt/homebrew/bin/lbzip2 | 8 |
+| 10 | 1469.6 | 338.2 | 304.3 | 1022.4 | /opt/homebrew/bin/lbzip2 | 8 |
+| 50 | 2010.7 | 330.9 | 336.5 | 1755.8 | /opt/homebrew/bin/lbzip2 | 8 |
+| 100 | 2238.2 | 336.6 | 343.2 | 1956.1 | /opt/homebrew/bin/lbzip2 | 8 |
 
 See `scripts/run_bench_multi.sh` for how the measurements were collected.
 
