@@ -305,12 +305,86 @@ impl<'a> BitCursor<'a> {
 }
 
 /// A canonical bzip2 Huffman decode table (limit/base/perm form).
+/// Width of the one-lookup Huffman fast path. 2^10 u16 entries = 2 KB per table —
+/// six tables stay comfortably in L1.
+const FAST_BITS: u32 = 10;
+
+/// MSB-first bit reader with a 64-bit reservoir, for the symbol-decode hot loop.
+/// [`refill`](BitReservoir::refill) tops the buffer up to at least 57 bits, so a
+/// whole Huffman code (≤ 20 bits) can be peeked and consumed without touching the
+/// input again. Past the end of input the buffer pads with zero bits; the overrun
+/// is caught by [`consume`](BitReservoir::consume), which checks the absolute bit
+/// position against the input length.
+struct BitReservoir<'a> {
+    data: &'a [u8],
+    /// Absolute bit index of the next unconsumed bit; `pos == next * 8 - have`.
+    pos: usize,
+    /// The `have` bits ending at byte boundary `next * 8`, right-aligned.
+    buf: u64,
+    have: u32,
+    next: usize,
+}
+
+impl<'a> BitReservoir<'a> {
+    fn new(data: &'a [u8], bit: usize) -> Self {
+        let mut r = BitReservoir {
+            data,
+            pos: (bit >> 3) << 3,
+            buf: 0,
+            have: 0,
+            next: bit >> 3,
+        };
+        r.refill();
+        // Discard the sub-byte offset; `pos` cannot overrun here because `bit` is a
+        // committed position.
+        r.have -= (bit & 7) as u32;
+        r.pos = bit;
+        r
+    }
+
+    #[inline(always)]
+    fn refill(&mut self) {
+        while self.have <= 56 {
+            let byte = if self.next < self.data.len() {
+                let b = self.data[self.next];
+                self.next += 1;
+                b as u64
+            } else {
+                0
+            };
+            self.buf = (self.buf << 8) | byte;
+            self.have += 8;
+        }
+    }
+
+    /// The next `n` bits without consuming them. Requires `n <= have` (guaranteed
+    /// for `n <= 57` after a refill); zero bits stand in past the end of input.
+    #[inline(always)]
+    fn peek(&self, n: u32) -> u32 {
+        ((self.buf >> (self.have - n)) & mask64(n)) as u32
+    }
+
+    /// Consume `n` peeked bits, failing if they extend past the real input.
+    #[inline(always)]
+    fn consume(&mut self, n: u32) -> Result<(), Error> {
+        self.pos += n as usize;
+        self.have -= n;
+        if self.pos > self.data.len() * 8 {
+            return Err(Error::Truncated);
+        }
+        Ok(())
+    }
+}
+
 struct HuffTable {
     min_len: u32,
     max_len: u32,
     limit: [i32; MAX_CODE_LEN + 2],
     base: [i32; MAX_CODE_LEN + 2],
     perm: Vec<usize>,
+    /// One-lookup decode for codes up to [`FAST_BITS`] long: `(len << 12) | sym`,
+    /// zero for longer codes (fall through to the canonical walk).
+    fast: Vec<u16>,
 }
 
 impl HuffTable {
@@ -341,6 +415,11 @@ impl HuffTable {
             base[i] += base[i - 1];
         }
 
+        // Per-length symbol counts and starting perm index, before `base` is
+        // repurposed as the decode offset below.
+        let counts = base;
+        let mut base = counts;
+
         let mut limit = [0i32; MAX_CODE_LEN + 2];
         let mut vec = 0i32;
         for l in min_len..=max_len {
@@ -352,38 +431,66 @@ impl HuffTable {
             base[l as usize] = ((limit[l as usize - 1] + 1) << 1) - base[l as usize];
         }
 
+        // Fast table: for every code of length l <= FAST_BITS, stamp its symbol and
+        // length into all 2^(FAST_BITS - l) slots sharing that l-bit prefix. Codes
+        // of an over-subscribed (malformed) table that fall outside the valid range
+        // are simply not stamped; they hit the canonical walk and fail there, so the
+        // fast path can never accept what the slow path would reject.
+        let mut fast = vec![0u16; 1 << FAST_BITS];
+        for l in min_len..=max_len.min(FAST_BITS) {
+            // Symbols with length l occupy perm indices `counts[l] .. counts[l + 1]`.
+            let pp_start = counts[l as usize] as usize;
+            let count = (counts[l as usize + 1] - counts[l as usize]) as usize;
+            for k in 0..count {
+                let idx = pp_start + k;
+                let v = base[l as usize] + idx as i32;
+                if v < 0 || v > limit[l as usize] || (v as u64) >= (1u64 << l) || idx >= alpha {
+                    continue;
+                }
+                let sym = perm[idx];
+                let lo = (v as usize) << (FAST_BITS - l);
+                let entry = ((l as u16) << 12) | sym as u16;
+                for slot in &mut fast[lo..lo + (1 << (FAST_BITS - l))] {
+                    *slot = entry;
+                }
+            }
+        }
+
         Ok(HuffTable {
             min_len,
             max_len,
             limit,
             base,
             perm,
+            fast,
         })
     }
 
-    #[inline]
-    fn decode(&self, bits: &mut BitCursor<'_>) -> Result<usize, Error> {
-        // Local copies to avoid repeated field access and to help the compiler
-        // optimize the hot decode loop. We do one checked bounds test and then
-        // use unchecked indexing for the actual lookup to avoid per-iteration
-        // bounds checks on `perm`.
-        let mut l = self.min_len as usize;
-        let max_len = self.max_len as usize;
-        let mut v = bits.read_bits(l as u32)? as i32;
-        // Safety: we will check `idx` before performing unchecked access.
-        while l <= max_len {
-            let limit_l = self.limit[l];
-            if v <= limit_l {
-                let idx = (v - self.base[l]) as usize;
+    #[inline(always)]
+    fn decode(&self, r: &mut BitReservoir<'_>) -> Result<usize, Error> {
+        r.refill();
+        let e = self.fast[r.peek(FAST_BITS) as usize];
+        if e != 0 {
+            r.consume((e >> 12) as u32)?;
+            return Ok((e & 0xfff) as usize);
+        }
+        // Canonical walk for codes longer than FAST_BITS (or malformed tables).
+        // The reservoir holds >= 57 bits after the refill, so every peek below is
+        // in range; a peek that leans on zero padding past the end of the input is
+        // rejected by `consume`.
+        let mut l = self.min_len;
+        let mut v = r.peek(l) as i32;
+        while l <= self.max_len {
+            if v <= self.limit[l as usize] {
+                let idx = (v - self.base[l as usize]) as usize;
                 if idx >= self.perm.len() {
                     return Err(Error::InvalidHuffman);
                 }
-                unsafe {
-                    return Ok(*self.perm.get_unchecked(idx));
-                }
+                r.consume(l)?;
+                return Ok(self.perm[idx]);
             }
             l += 1;
-            v = (v << 1) | bits.read_bit()? as i32;
+            v = r.peek(l) as i32;
         }
         Err(Error::InvalidHuffman)
     }
@@ -392,6 +499,12 @@ impl HuffTable {
 enum Phase {
     StreamStart,
     Block,
+}
+
+/// One step of the prepare-only driver behind the pipelined whole-buffer decoder.
+enum Prepared {
+    Block { block_crc: u32, orig_ptr: usize },
+    Eof,
 }
 
 /// One step of the sans-io machine: a block's plaintext was appended, or the input
@@ -550,6 +663,79 @@ impl BlockDecoder {
     }
 
     fn decode_block(&mut self, bits: &mut BitCursor<'_>, out: &mut Vec<u8>) -> Result<(), Error> {
+        let (block_crc, orig_ptr) = self.prepare_block(bits)?;
+
+        let crc = WalkCursor::begin(&self.tt, orig_ptr, out).finish();
+        if crc != block_crc {
+            return Err(Error::CrcMismatch);
+        }
+        self.combined_crc = self.combined_crc.rotate_left(1);
+        self.combined_crc ^= block_crc;
+
+        Ok(())
+    }
+
+    /// Drive the stream machine to the next block's prepared state: headers and
+    /// end-of-stream markers are consumed exactly as [`run`](BlockDecoder::run)
+    /// consumes them, but the block itself is only prepared (bits read, `tt` built)
+    /// — not walked, and its CRC not yet folded into the combined CRC.
+    fn prepare_next(&mut self, input: &[u8]) -> Result<Prepared, Error> {
+        let mut bits = BitCursor::new(input, self.bit);
+        loop {
+            match self.phase {
+                Phase::StreamStart => {
+                    bits.align_to_byte();
+                    if bits.bytes_left() == 0 {
+                        self.bit = bits.bit;
+                        return Ok(Prepared::Eof);
+                    }
+                    if bits.bytes_left() < 4 {
+                        return Err(Error::Truncated);
+                    }
+                    let b0 = bits.read_bits(8)? as u8;
+                    let b1 = bits.read_bits(8)? as u8;
+                    let b2 = bits.read_bits(8)? as u8;
+                    let lvl = bits.read_bits(8)? as u8;
+                    if b0 != b'B' || b1 != b'Z' || b2 != b'h' {
+                        return Err(Error::InvalidMagic);
+                    }
+                    if !(b'1'..=b'9').contains(&lvl) {
+                        return Err(Error::InvalidLevel);
+                    }
+                    self.block_size = (lvl - b'0') as usize * 100_000;
+                    self.combined_crc = 0;
+                    self.phase = Phase::Block;
+                    self.bit = bits.bit;
+                }
+                Phase::Block => {
+                    let magic = bits.read_magic()?;
+                    if magic == BLOCK_MAGIC {
+                        let (block_crc, orig_ptr) = self.prepare_block(&mut bits)?;
+                        self.bit = bits.bit;
+                        return Ok(Prepared::Block {
+                            block_crc,
+                            orig_ptr,
+                        });
+                    } else if magic == EOS_MAGIC {
+                        let stored = bits.read_bits(32)?;
+                        if stored != self.combined_crc {
+                            return Err(Error::CrcMismatch);
+                        }
+                        self.phase = Phase::StreamStart;
+                        self.bit = bits.bit;
+                    } else {
+                        return Err(Error::InvalidMagic);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Everything in a block that reads bits: headers, Huffman decode, MTF/RLE2, and
+    /// the IBWT threading pass. On success `self.tt` holds the successor vector and
+    /// the returned pair is the stored block CRC and the walk's starting cell; no
+    /// output has been produced yet.
+    fn prepare_block(&mut self, bits: &mut BitCursor<'_>) -> Result<(u32, usize), Error> {
         #[cfg(feature = "phasetime")]
         let mut _pt = phasetime::Scope::new();
         let block_crc = bits.read_bits(32)?;
@@ -637,12 +823,35 @@ impl BlockDecoder {
         // Avoid reallocations for the common case by reserving the declared block size.
         self.bytes.reserve(self.block_size);
         let mut cftab = [0u32; 257];
-        let mut mtf = seq_to_unseq.clone();
+        // MTF list as a sparse arena of 16-entry cache blocks (libbz2's scheme): a
+        // front move shifts at most 15 bytes within one block plus one boundary
+        // byte per block below it, instead of memmoving up to 255 bytes. Blocks
+        // start at the top of the arena and creep down one slot per long move; the
+        // arena is repacked upward when the front reaches slot zero.
+        const MTFL: usize = 16;
+        const MTFA_SIZE: usize = 4096;
+        let mut mtfa = [0u8; MTFA_SIZE];
+        let mut mtfbase = [0usize; 256 / MTFL];
+        {
+            let mut kk = MTFA_SIZE;
+            for ii in (0..256 / MTFL).rev() {
+                for jj in (0..MTFL).rev() {
+                    kk -= 1;
+                    let pos = ii * MTFL + jj;
+                    mtfa[kk] = if pos < n_in_use { seq_to_unseq[pos] } else { 0 };
+                }
+                mtfbase[ii] = kk;
+            }
+        }
         let mut sel_idx = 0usize;
         let mut group_count = 0usize;
         let mut cur_table = 0usize;
         let mut run: u64 = 0;
         let mut run_bit: u32 = 0;
+
+        // The symbol loop reads through a reservoir instead of the plain cursor;
+        // the position is handed back to `bits` after the EOB symbol.
+        let mut r = BitReservoir::new(bits.data, bits.bit);
 
         loop {
             if group_count == 0 {
@@ -654,7 +863,7 @@ impl BlockDecoder {
                 group_count = GROUP_SIZE;
             }
             group_count -= 1;
-            let sym = tables[cur_table].decode(bits)?;
+            let sym = tables[cur_table].decode(&mut r)?;
 
             if sym <= 1 {
                 // RUNA (0) / RUNB (1): bijective base-2 zero-run length.
@@ -673,7 +882,7 @@ impl BlockDecoder {
             }
 
             if run > 0 {
-                let b = mtf[0];
+                let b = mtfa[mtfbase[0]];
                 if self.bytes.len() + run as usize > self.block_size {
                     return Err(Error::BlockOverflow);
                 }
@@ -685,17 +894,54 @@ impl BlockDecoder {
             }
 
             if sym == eob {
+                // Hand the reservoir's position back to the caller's cursor.
+                bits.bit = r.pos;
                 break;
             }
 
             // MTF index (sym - 1): move that byte value to the front.
             let nn = sym - 1;
-            if nn >= mtf.len() {
+            if nn >= n_in_use {
                 return Err(Error::InvalidBlock);
             }
-            let b = mtf[nn];
-            mtf.copy_within(0..nn, 1);
-            mtf[0] = b;
+            let b;
+            if nn < MTFL {
+                // Within the front block: shift at most 15 bytes.
+                let pp = mtfbase[0];
+                b = mtfa[pp + nn];
+                mtfa.copy_within(pp..pp + nn, pp + 1);
+                mtfa[pp] = b;
+            } else {
+                // Shift within the symbol's own block, then cascade one boundary
+                // byte down through each block in front of it.
+                let mut lno = nn / MTFL;
+                let off = nn % MTFL;
+                let mut pp = mtfbase[lno] + off;
+                b = mtfa[pp];
+                while pp > mtfbase[lno] {
+                    mtfa[pp] = mtfa[pp - 1];
+                    pp -= 1;
+                }
+                mtfbase[lno] += 1;
+                while lno > 0 {
+                    mtfbase[lno] -= 1;
+                    mtfa[mtfbase[lno]] = mtfa[mtfbase[lno - 1] + MTFL - 1];
+                    lno -= 1;
+                }
+                mtfbase[0] -= 1;
+                mtfa[mtfbase[0]] = b;
+                if mtfbase[0] == 0 {
+                    // The blocks have crept to the bottom; repack them at the top.
+                    let mut kk = MTFA_SIZE;
+                    for ii in (0..256 / MTFL).rev() {
+                        for jj in (0..MTFL).rev() {
+                            kk -= 1;
+                            mtfa[kk] = mtfa[mtfbase[ii] + jj];
+                        }
+                        mtfbase[ii] = kk;
+                    }
+                }
+            }
 
             if self.bytes.len() + 1 > self.block_size {
                 return Err(Error::BlockOverflow);
@@ -741,87 +987,192 @@ impl BlockDecoder {
 
         #[cfg(feature = "phasetime")]
         _pt.lap(2); // cftab + index threading
-        // Walk the permutation, applying RLE1 and CRC to produce the plaintext block.
-        // The CRC stays fused into this loop: the walk is latency-bound on the
-        // dependent `tt` load chain, so the per-byte CRC executes for free under it.
-        // No bits are read past this point, so `out` only grows once the block is
-        // structurally sound.
-        let mut crc = 0xFFFF_FFFFu32;
-        // Each cell holds `(next_pos << 8) | byte_of_next_pos`, so one load per step
-        // yields both the byte to emit and where to go.
-        let mut t_pos = self.tt[orig_ptr];
-        let mut prev: i32 = -1;
-        let mut count: u32 = 0;
-        // Write through a raw cursor into reserved capacity: one capacity check per
-        // iteration (against the 255-byte worst case) instead of a `push` per byte,
-        // and RLE1 runs become a single `write_bytes` (memset).
-        unsafe {
-            let tt_ptr = self.tt.as_ptr();
-            let mut len = out.len();
-            let mut dst = out.as_mut_ptr().add(len);
-            let mut room = out.capacity() - len;
-            for _ in 0..nblock {
-                if room < 256 {
-                    out.set_len(len);
-                    out.reserve(nblock.max(4096));
-                    dst = out.as_mut_ptr().add(len);
-                    room = out.capacity() - len;
-                }
-                let b = (t_pos & 0xff) as u8;
-                t_pos = *tt_ptr.add((t_pos >> 8) as usize);
+        Ok((block_crc, orig_ptr))
+    }
+}
 
-                if count == 4 {
-                    // `b` is the count of extra repeats beyond the four literals.
-                    ptr::write_bytes(dst, prev as u8, b as usize);
-                    for _ in 0..b {
-                        crc = crc_update(crc, prev as u8);
-                    }
-                    dst = dst.add(b as usize);
-                    len += b as usize;
-                    room -= b as usize;
-                    count = 0;
-                    prev = -1;
-                } else {
-                    *dst = b;
-                    dst = dst.add(1);
-                    len += 1;
-                    room -= 1;
-                    crc = crc_update(crc, b);
-                    if b as i32 == prev {
-                        count += 1;
-                    } else {
-                        prev = b as i32;
-                        count = 1;
-                    }
-                }
-            }
-            out.set_len(len);
+/// The IBWT permutation walk over a prepared successor vector, applying RLE1 and the
+/// CRC to append one block's plaintext to `out`.
+///
+/// This is a struct rather than a loop so two blocks' walks can be interleaved: each
+/// step is a serial dependent load (`t = tt[t >> 8]`), so a single walk is bound by
+/// memory latency, but two walks over different blocks are independent chains and
+/// overlap almost perfectly. The CRC stays fused under the walk where it executes
+/// for free.
+///
+/// [`step`](WalkCursor::step) must be called at most [`WalkCursor::rem`] times; state
+/// is committed back to the `Vec` by [`finish`](WalkCursor::finish).
+struct WalkCursor<'a> {
+    tt: *const u32,
+    /// Cells hold `(next_pos << 8) | byte_of_next_pos`, so one load per step yields
+    /// both the byte to emit and where to go next.
+    t_pos: u32,
+    prev: i32,
+    count: u32,
+    crc: u32,
+    /// Steps left; one step per `tt` cell.
+    rem: usize,
+    out: &'a mut Vec<u8>,
+    /// Write cursor into `out`'s reserved capacity: one capacity check per step
+    /// (against the 255-byte RLE1 worst case) instead of a `push` per byte, and RLE1
+    /// runs become a single `write_bytes` (memset).
+    len: usize,
+    dst: *mut u8,
+    room: usize,
+}
+
+impl<'a> WalkCursor<'a> {
+    fn begin(tt: &[u32], orig_ptr: usize, out: &'a mut Vec<u8>) -> WalkCursor<'a> {
+        let len = out.len();
+        WalkCursor {
+            tt: tt.as_ptr(),
+            t_pos: tt[orig_ptr],
+            prev: -1,
+            count: 0,
+            crc: 0xFFFF_FFFF,
+            rem: tt.len(),
+            dst: out.as_mut_ptr().wrapping_add(len),
+            room: out.capacity() - len,
+            len,
+            out,
         }
+    }
 
+    /// # Safety
+    /// At most `rem` total calls, with `rem` decremented by the caller per call.
+    #[inline(always)]
+    unsafe fn step(&mut self) {
+        if self.room < 256 {
+            self.out.set_len(self.len);
+            self.out.reserve(self.rem.max(4096));
+            self.dst = self.out.as_mut_ptr().add(self.len);
+            self.room = self.out.capacity() - self.len;
+        }
+        let b = (self.t_pos & 0xff) as u8;
+        self.t_pos = *self.tt.add((self.t_pos >> 8) as usize);
+
+        if self.count == 4 {
+            // `b` is the count of extra repeats beyond the four literals.
+            ptr::write_bytes(self.dst, self.prev as u8, b as usize);
+            for _ in 0..b {
+                self.crc = crc_update(self.crc, self.prev as u8);
+            }
+            self.dst = self.dst.add(b as usize);
+            self.len += b as usize;
+            self.room -= b as usize;
+            self.count = 0;
+            self.prev = -1;
+        } else {
+            *self.dst = b;
+            self.dst = self.dst.add(1);
+            self.len += 1;
+            self.room -= 1;
+            self.crc = crc_update(self.crc, b);
+            if b as i32 == self.prev {
+                self.count += 1;
+            } else {
+                self.prev = b as i32;
+                self.count = 1;
+            }
+        }
+    }
+
+    /// Run the remaining steps, commit the output length, and return the block CRC.
+    fn finish(mut self) -> u32 {
+        #[cfg(feature = "phasetime")]
+        let mut _pt = phasetime::Scope::new();
+        unsafe {
+            while self.rem > 0 {
+                self.step();
+                self.rem -= 1;
+            }
+            self.out.set_len(self.len);
+        }
         #[cfg(feature = "phasetime")]
         _pt.lap(3); // permutation walk + RLE1 + CRC
-        let crc = !crc;
-        if crc != block_crc {
-            return Err(Error::CrcMismatch);
-        }
-        self.combined_crc = self.combined_crc.rotate_left(1);
-        self.combined_crc ^= block_crc;
-
-        Ok(())
+        !self.crc
     }
+}
+
+/// Walk two prepared blocks with their steps interleaved, so the two serial
+/// dependent-load chains overlap in the memory system. Returns both block CRCs.
+fn walk_pair(mut a: WalkCursor<'_>, mut b: WalkCursor<'_>) -> (u32, u32) {
+    unsafe {
+        while a.rem > 0 && b.rem > 0 {
+            a.step();
+            b.step();
+            a.rem -= 1;
+            b.rem -= 1;
+        }
+    }
+    (a.finish(), b.finish())
 }
 
 /// Decompress an entire in-memory `.bz2` buffer. Available without `std`.
 ///
 /// Handles concatenated (multi-stream) input and verifies both the per-block and the
-/// combined-stream CRC. Peak memory is the plaintext plus one block of scratch.
+/// combined-stream CRC. Peak memory is the plaintext plus two blocks of scratch:
+/// consecutive blocks are decoded as a software-pipelined pair so their IBWT
+/// permutation walks — each a serial dependent-load chain, and the majority of
+/// decode time — overlap in the memory system.
 pub fn decompress_to_vec(compressed: &[u8]) -> Result<Vec<u8>, Error> {
-    let mut dec = BlockDecoder::new();
+    let mut a = BlockDecoder::new();
+    let mut b = BlockDecoder::new();
     let mut out = Vec::new();
+    let mut tmp: Vec<u8> = Vec::new();
     loop {
-        match dec.next_block(compressed, &mut out)? {
-            Step::Block => {}
-            Step::Eof => return Ok(out),
+        match a.prepare_next(compressed)? {
+            Prepared::Eof => return Ok(out),
+            Prepared::Block {
+                block_crc,
+                orig_ptr,
+            } => {
+                // Peek: if another block of the same stream follows immediately,
+                // prepare it too and walk the two interleaved. `b`'s output goes to
+                // a reused side buffer because its final position in `out` is not
+                // known until `a`'s RLE1 expansion finishes.
+                b.bit = a.bit;
+                b.phase = Phase::Block;
+                b.block_size = a.block_size;
+                let follow = {
+                    let mut bits = BitCursor::new(compressed, b.bit);
+                    if bits.read_magic() == Ok(BLOCK_MAGIC) {
+                        b.prepare_block(&mut bits)
+                            .ok()
+                            .map(|(crc, ptr)| (crc, ptr, bits.bit))
+                    } else {
+                        None
+                    }
+                };
+                match follow {
+                    Some((crc_b, ptr_b, end_b)) => {
+                        tmp.clear();
+                        let (ca, cb) = walk_pair(
+                            WalkCursor::begin(&a.tt, orig_ptr, &mut out),
+                            WalkCursor::begin(&b.tt, ptr_b, &mut tmp),
+                        );
+                        if ca != block_crc {
+                            return Err(Error::CrcMismatch);
+                        }
+                        a.combined_crc = a.combined_crc.rotate_left(1) ^ block_crc;
+                        if cb == crc_b {
+                            out.extend_from_slice(&tmp);
+                            a.combined_crc = a.combined_crc.rotate_left(1) ^ crc_b;
+                            a.bit = end_b;
+                        }
+                        // On a mismatch `b`'s output is simply dropped: `a` re-decodes
+                        // that block on the next iteration and reports the exact error
+                        // the serial machine would.
+                    }
+                    None => {
+                        let crc = WalkCursor::begin(&a.tt, orig_ptr, &mut out).finish();
+                        if crc != block_crc {
+                            return Err(Error::CrcMismatch);
+                        }
+                        a.combined_crc = a.combined_crc.rotate_left(1) ^ block_crc;
+                    }
+                }
+            }
         }
     }
 }

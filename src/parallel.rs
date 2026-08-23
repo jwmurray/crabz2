@@ -32,7 +32,9 @@ use std::sync::Mutex;
 
 use rayon::prelude::*;
 
-use crate::{BitCursor, BlockDecoder, Error, Phase, Step, BLOCK_MAGIC, EOS_MAGIC};
+use crate::{
+    walk_pair, BitCursor, BlockDecoder, Error, Phase, Step, WalkCursor, BLOCK_MAGIC, EOS_MAGIC,
+};
 
 /// The largest block any level can declare (level 9). Speculative decodes run
 /// against this bound because the stream header that states the real one has not
@@ -144,27 +146,74 @@ struct Decoded {
     nblock: usize,
 }
 
-/// Decode one block starting at the magic at `start_bit`. `None` for anything that
-/// is not a well-formed block: a false positive, or a real block whose bits were
-/// truncated. `dec` is caller-owned scratch: its buffers are reused across
-/// speculative decodes on the same worker so each block does not re-fault fresh
-/// pages for the multi-megabyte BWT scratch.
-fn speculate(dec: &mut BlockDecoder, input: &[u8], start_bit: usize) -> Option<Decoded> {
+/// Run the bit-consuming half of a speculative block decode — magic, headers,
+/// Huffman, MTF/RLE2, IBWT threading — leaving `dec.tt` ready to walk. Returns the
+/// stored block CRC, the walk start cell, and the end bit. `None` for anything that
+/// is not a well-formed block prefix. `dec` is caller-owned scratch: its buffers are
+/// reused across speculative decodes on the same worker so each block does not
+/// re-fault fresh pages for the multi-megabyte BWT scratch.
+fn prepare_speculative(
+    dec: &mut BlockDecoder,
+    input: &[u8],
+    start_bit: usize,
+) -> Option<(u32, usize, usize)> {
     dec.bit = start_bit;
     dec.phase = Phase::Block;
     dec.block_size = MAX_BLOCK_SIZE;
-    // The first block folded into a zeroed combined CRC is the block CRC.
-    dec.combined_crc = 0;
-    let mut out = Vec::new();
-    match dec.next_block(input, &mut out) {
-        Ok(Step::Block) => Some(Decoded {
-            end_bit: dec.bit,
-            out,
-            crc: dec.combined_crc,
-            nblock: dec.tt.len(),
-        }),
-        _ => None,
+    let mut bits = BitCursor::new(input, start_bit);
+    if bits.read_magic() != Ok(BLOCK_MAGIC) {
+        return None;
     }
+    match dec.prepare_block(&mut bits) {
+        Ok((block_crc, orig_ptr)) => Some((block_crc, orig_ptr, bits.bit)),
+        Err(_) => None,
+    }
+}
+
+/// Finish one prepared block: walk it (producing `out`) and check the data against
+/// the stored CRC. A mismatch yields `None`, exactly as the serial decoder would
+/// refuse the block.
+fn accept(prep: Option<(u32, usize, usize)>, crc: u32, out: Vec<u8>, dec: &BlockDecoder) -> Option<Decoded> {
+    let (block_crc, _, end_bit) = prep?;
+    if crc != block_crc {
+        return None;
+    }
+    Some(Decoded {
+        end_bit,
+        out,
+        crc: block_crc,
+        nblock: dec.tt.len(),
+    })
+}
+
+/// Decode up to two candidate blocks, interleaving their permutation walks so the
+/// two serial dependent-load chains overlap in the memory system — the walk is the
+/// latency-bound majority of block decode, so pairing nearly doubles per-worker
+/// throughput.
+fn speculate_pair(
+    a: &mut BlockDecoder,
+    b: &mut BlockDecoder,
+    input: &[u8],
+    s1: usize,
+    s2: Option<usize>,
+) -> (Option<Decoded>, Option<Decoded>) {
+    let prep_a = prepare_speculative(a, input, s1);
+    let prep_b = s2.and_then(|s| prepare_speculative(b, input, s));
+    let mut out_a = Vec::new();
+    let mut out_b = Vec::new();
+    let (crc_a, crc_b) = match (prep_a, prep_b) {
+        (Some((_, ptr_a, _)), Some((_, ptr_b, _))) => walk_pair(
+            WalkCursor::begin(&a.tt, ptr_a, &mut out_a),
+            WalkCursor::begin(&b.tt, ptr_b, &mut out_b),
+        ),
+        (Some((_, ptr_a, _)), None) => (WalkCursor::begin(&a.tt, ptr_a, &mut out_a).finish(), 0),
+        (None, Some((_, ptr_b, _))) => (0, WalkCursor::begin(&b.tt, ptr_b, &mut out_b).finish()),
+        (None, None) => (0, 0),
+    };
+    (
+        accept(prep_a, crc_a, out_a, a),
+        accept(prep_b, crc_b, out_b, b),
+    )
 }
 
 /// Serial decode from a committed boundary to the end of the input, appending to
@@ -376,21 +425,39 @@ pub(crate) fn decode(input: &[u8]) -> Result<(Vec<u8>, usize), Error> {
 
     // Per-worker scratch that outlives this call: pool threads persist, so the
     // multi-megabyte BWT buffers stay allocated (and their pages stay faulted in)
-    // across blocks *and* across `decompress_parallel` calls.
+    // across blocks *and* across `decompress_parallel` calls. Two decoders per
+    // worker because candidates are speculated in pairs with interleaved walks.
     std::thread_local! {
-        static SCRATCH: core::cell::RefCell<BlockDecoder> =
-            core::cell::RefCell::new(BlockDecoder::new());
+        static SCRATCH: core::cell::RefCell<(BlockDecoder, BlockDecoder)> =
+            core::cell::RefCell::new((BlockDecoder::new(), BlockDecoder::new()));
     }
-    let decoded: Vec<Option<Decoded>> = candidates
-        .par_iter()
-        .map(|&start| SCRATCH.with(|d| speculate(&mut d.borrow_mut(), input, start)))
+    // Interleaved pair decode halves the task count, so only pair when there are
+    // still several tasks per worker — otherwise (few blocks) pairing costs more
+    // occupancy than the overlapped walks win back.
+    let chunk = if candidates.len() >= 4 * rayon::current_num_threads() {
+        2
+    } else {
+        1
+    };
+    let decoded: Vec<(Option<Decoded>, Option<Decoded>)> = candidates
+        .par_chunks(chunk)
+        .map(|pair| {
+            SCRATCH.with(|cell| {
+                let (a, b) = &mut *cell.borrow_mut();
+                speculate_pair(a, b, input, pair[0], pair.get(1).copied())
+            })
+        })
         .collect();
 
-    let blocks: BTreeMap<usize, Decoded> = candidates
-        .iter()
-        .zip(decoded)
-        .filter_map(|(&start, d)| d.map(|d| (start, d)))
-        .collect();
+    let mut blocks: BTreeMap<usize, Decoded> = BTreeMap::new();
+    for (pair, (da, db)) in candidates.chunks(chunk).zip(decoded) {
+        if let Some(d) = da {
+            blocks.insert(pair[0], d);
+        }
+        if let (Some(&start), Some(d)) = (pair.get(1), db) {
+            blocks.insert(start, d);
+        }
+    }
 
     assemble(input, blocks)
 }
@@ -491,5 +558,57 @@ mod tests {
     fn scanner_reports_no_candidate_in_empty_or_tiny_input() {
         assert!(scan_candidates(&[]).is_empty());
         assert!(scan_candidates(&[0x31, 0x41, 0x59]).is_empty());
+    }
+
+    /// Dev experiment, not a correctness test: times two sequential walks against
+    /// one interleaved pair walk on latency-hostile (pseudo-random) blocks.
+    /// `cargo test --release --features parallel pair_walk_overlap -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn pair_walk_overlap() {
+        // Word-salad plaintext: compressible but with no BWT walk locality.
+        let mut plain = Vec::new();
+        let words: &[&[u8]] = &[
+            b"alpha", b"bravo", b"charlie", b"delta", b"echo", b"foxtrot", b"golf", b"hotel",
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        while plain.len() < 2_000_000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            plain.extend_from_slice(words[(state >> 33) as usize % words.len()]);
+            plain.push(b' ');
+        }
+        let packed = crate::compress(&plain, crate::Level::BEST);
+        let starts = scan_candidates(&packed);
+        assert!(starts.len() >= 2, "need two blocks, got {}", starts.len());
+
+        let mut a = BlockDecoder::new();
+        let mut b = BlockDecoder::new();
+        let pa = prepare_speculative(&mut a, &packed, starts[0]).unwrap();
+        let pb = prepare_speculative(&mut b, &packed, starts[1]).unwrap();
+
+        for round in 0..3 {
+            let mut out_a = Vec::new();
+            let mut out_b = Vec::new();
+            let t = std::time::Instant::now();
+            let ca = crate::WalkCursor::begin(&a.tt, pa.1, &mut out_a).finish();
+            let cb = crate::WalkCursor::begin(&b.tt, pb.1, &mut out_b).finish();
+            let sequential = t.elapsed();
+
+            let mut out_a2 = Vec::new();
+            let mut out_b2 = Vec::new();
+            let t = std::time::Instant::now();
+            let (ca2, cb2) = walk_pair(
+                crate::WalkCursor::begin(&a.tt, pa.1, &mut out_a2),
+                crate::WalkCursor::begin(&b.tt, pb.1, &mut out_b2),
+            );
+            let paired = t.elapsed();
+
+            assert_eq!((ca, cb), (ca2, cb2));
+            assert_eq!(out_a, out_a2);
+            assert_eq!(out_b, out_b2);
+            eprintln!("round {round}: sequential {sequential:?} vs paired {paired:?}");
+        }
     }
 }
