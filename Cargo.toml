@@ -68,6 +68,12 @@ libbz2 = ["bzip2"]
 # Dev-only: per-phase timers inside `decode_block` (Phase A profiling). Never default.
 phasetime = ["std"]
 
+# Compile the decoder with zero `unsafe` — the hot paths (IBWT threading, the
+# permutation walk, parallel output assembly) swap to fully safe equivalents with
+# identical output and errors, and `#![forbid(unsafe_code)]` makes the compiler
+# prove no unsafe remains. Costs speed; see the README for measurements.
+forbid-unsafe = []
+
 # The examples are std-only CLIs; skip them under --no-default-features.
 [[example]]
 name = "crabz2"

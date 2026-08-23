@@ -25,6 +25,11 @@ jobs:
       # never builds this feature.
       - name: test parallel block decode
         run: cargo test --features parallel
+      # The zero-unsafe build swaps every unsafe hot path for a safe equivalent
+      # and forbids unsafe_code crate-wide; the lib tests prove the swapped
+      # paths produce identical output.
+      - name: test forbid-unsafe build
+        run: cargo test --features "parallel forbid-unsafe" --lib
 
   msrv:
     name: MSRV 1.63
@@ -57,6 +62,7 @@ jobs:
       - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --features parallel -- -D warnings
+      - run: cargo clippy --all-targets --features "parallel forbid-unsafe" -- -D warnings
       - run: cargo fmt --check
 
   cross:

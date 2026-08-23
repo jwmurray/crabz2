@@ -26,6 +26,7 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+#[cfg(not(feature = "forbid-unsafe"))]
 use core::mem::MaybeUninit;
 use std::io;
 use std::sync::Mutex;
@@ -277,22 +278,46 @@ fn stitch(segments: Vec<Segment>) -> Vec<u8> {
     }
 
     // Carve the spare capacity into one disjoint `&mut` slice per segment.
-    let mut spare: &mut [MaybeUninit<u8>] = &mut out.spare_capacity_mut()[..total];
-    let mut slots: Vec<&mut [MaybeUninit<u8>]> = Vec::with_capacity(segments.len());
-    for s in &segments {
-        let (head, rest) = spare.split_at_mut(s.bytes().len());
-        slots.push(head);
-        spare = rest;
+    #[cfg(not(feature = "forbid-unsafe"))]
+    {
+        let mut spare: &mut [MaybeUninit<u8>] = &mut out.spare_capacity_mut()[..total];
+        let mut slots: Vec<&mut [MaybeUninit<u8>]> = Vec::with_capacity(segments.len());
+        for s in &segments {
+            let (head, rest) = spare.split_at_mut(s.bytes().len());
+            slots.push(head);
+            spare = rest;
+        }
+        segments
+            .par_iter()
+            .zip(slots)
+            .for_each(|(seg, slot)| unsafe {
+                let src = seg.bytes();
+                core::ptr::copy_nonoverlapping(
+                    src.as_ptr(),
+                    slot.as_mut_ptr() as *mut u8,
+                    src.len(),
+                );
+            });
+        // Safety: the slots partition `0..total` and every byte was written above.
+        unsafe { out.set_len(total) };
     }
-    segments
-        .par_iter()
-        .zip(slots)
-        .for_each(|(seg, slot)| unsafe {
-            let src = seg.bytes();
-            core::ptr::copy_nonoverlapping(src.as_ptr(), slot.as_mut_ptr() as *mut u8, src.len());
-        });
-    // Safety: the slots partition `0..total` and every byte was written above.
-    unsafe { out.set_len(total) };
+    // Safe variant: zero-fill first (alloc_zeroed pages, nearly free), then carve
+    // the initialized buffer into disjoint `&mut` slices — no uninitialized memory.
+    #[cfg(feature = "forbid-unsafe")]
+    {
+        out.resize(total, 0);
+        let mut spare: &mut [u8] = &mut out[..];
+        let mut slots: Vec<&mut [u8]> = Vec::with_capacity(segments.len());
+        for s in &segments {
+            let (head, rest) = spare.split_at_mut(s.bytes().len());
+            slots.push(head);
+            spare = rest;
+        }
+        segments
+            .par_iter()
+            .zip(slots)
+            .for_each(|(seg, slot)| slot.copy_from_slice(seg.bytes()));
+    }
     out
 }
 
