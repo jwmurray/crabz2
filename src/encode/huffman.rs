@@ -408,7 +408,7 @@ mod tests {
             bytes.extend_from_slice(&[0u8; 8]);
 
             let table = HuffTable::build(&lens).expect("decoder rejected our lengths");
-            let mut r = BitCursor::new(&bytes, 0);
+            let mut r = crate::BitReservoir::new(&bytes, 0);
             for &want in &sequence {
                 assert_eq!(table.decode(&mut r).unwrap(), want);
             }

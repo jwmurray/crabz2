@@ -65,6 +65,9 @@ parallel = ["dep:rayon", "std"]
 # Optional C-backed libbz2 baseline used by the `examples/compare.rs` example.
 libbz2 = ["bzip2"]
 
+# Dev-only: per-phase timers inside `decode_block` (Phase A profiling). Never default.
+phasetime = ["std"]
+
 # The examples are std-only CLIs; skip them under --no-default-features.
 [[example]]
 name = "crabz2"

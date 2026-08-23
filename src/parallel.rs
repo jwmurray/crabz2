@@ -24,12 +24,17 @@
 //! degrading to different bytes is not.
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::mem::MaybeUninit;
 use std::io;
+use std::sync::Mutex;
 
 use rayon::prelude::*;
 
-use crate::{BitCursor, BlockDecoder, Error, Phase, Step, BLOCK_MAGIC, EOS_MAGIC};
+use crate::{
+    walk_pair, BitCursor, BlockDecoder, Error, Phase, Step, WalkCursor, BLOCK_MAGIC, EOS_MAGIC,
+};
 
 /// The largest block any level can declare (level 9). Speculative decodes run
 /// against this bound because the stream header that states the real one has not
@@ -141,25 +146,79 @@ struct Decoded {
     nblock: usize,
 }
 
-/// Decode one block starting at the magic at `start_bit`. `None` for anything that
-/// is not a well-formed block: a false positive, or a real block whose bits were
-/// truncated.
-fn speculate(input: &[u8], start_bit: usize) -> Option<Decoded> {
-    let mut dec = BlockDecoder::new();
+/// Run the bit-consuming half of a speculative block decode — magic, headers,
+/// Huffman, MTF/RLE2, IBWT threading — leaving `dec.tt` ready to walk. Returns the
+/// stored block CRC, the walk start cell, and the end bit. `None` for anything that
+/// is not a well-formed block prefix. `dec` is caller-owned scratch: its buffers are
+/// reused across speculative decodes on the same worker so each block does not
+/// re-fault fresh pages for the multi-megabyte BWT scratch.
+fn prepare_speculative(
+    dec: &mut BlockDecoder,
+    input: &[u8],
+    start_bit: usize,
+) -> Option<(u32, usize, usize)> {
     dec.bit = start_bit;
     dec.phase = Phase::Block;
     dec.block_size = MAX_BLOCK_SIZE;
-    let mut out = Vec::new();
-    match dec.next_block(input, &mut out) {
-        Ok(Step::Block) => Some(Decoded {
-            end_bit: dec.bit,
-            out,
-            // The first block folded into a zeroed combined CRC is the block CRC.
-            crc: dec.combined_crc,
-            nblock: dec.tt.len(),
-        }),
-        _ => None,
+    let mut bits = BitCursor::new(input, start_bit);
+    if bits.read_magic() != Ok(BLOCK_MAGIC) {
+        return None;
     }
+    match dec.prepare_block(&mut bits) {
+        Ok((block_crc, orig_ptr)) => Some((block_crc, orig_ptr, bits.bit)),
+        Err(_) => None,
+    }
+}
+
+/// Finish one prepared block: walk it (producing `out`) and check the data against
+/// the stored CRC. A mismatch yields `None`, exactly as the serial decoder would
+/// refuse the block.
+fn accept(
+    prep: Option<(u32, usize, usize)>,
+    crc: u32,
+    out: Vec<u8>,
+    dec: &BlockDecoder,
+) -> Option<Decoded> {
+    let (block_crc, _, end_bit) = prep?;
+    if crc != block_crc {
+        return None;
+    }
+    Some(Decoded {
+        end_bit,
+        out,
+        crc: block_crc,
+        nblock: dec.tt.len(),
+    })
+}
+
+/// Decode up to two candidate blocks, interleaving their permutation walks so the
+/// two serial dependent-load chains overlap in the memory system — the walk is the
+/// latency-bound majority of block decode, so pairing nearly doubles per-worker
+/// throughput.
+fn speculate_pair(
+    a: &mut BlockDecoder,
+    b: &mut BlockDecoder,
+    input: &[u8],
+    s1: usize,
+    s2: Option<usize>,
+) -> (Option<Decoded>, Option<Decoded>) {
+    let prep_a = prepare_speculative(a, input, s1);
+    let prep_b = s2.and_then(|s| prepare_speculative(b, input, s));
+    let mut out_a = Vec::new();
+    let mut out_b = Vec::new();
+    let (crc_a, crc_b) = match (prep_a, prep_b) {
+        (Some((_, ptr_a, _)), Some((_, ptr_b, _))) => walk_pair(
+            WalkCursor::begin(&a.tt, ptr_a, &mut out_a),
+            WalkCursor::begin(&b.tt, ptr_b, &mut out_b),
+        ),
+        (Some((_, ptr_a, _)), None) => (WalkCursor::begin(&a.tt, ptr_a, &mut out_a).finish(), 0),
+        (None, Some((_, ptr_b, _))) => (0, WalkCursor::begin(&b.tt, ptr_b, &mut out_b).finish()),
+        (None, None) => (0, 0),
+    };
+    (
+        accept(prep_a, crc_a, out_a, a),
+        accept(prep_b, crc_b, out_b, b),
+    )
 }
 
 /// Serial decode from a committed boundary to the end of the input, appending to
@@ -186,19 +245,77 @@ fn finish_serially(
     }
 }
 
+/// One run of output bytes, in stream order: an accepted speculative block, or the
+/// serial tail decoded after the fast path abandoned the chain.
+enum Segment {
+    Fast(Decoded),
+    Serial(Vec<u8>),
+}
+
+impl Segment {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Segment::Fast(d) => &d.out,
+            Segment::Serial(v) => v,
+        }
+    }
+}
+
+/// Concatenate the segments. The chain walk is cheap (it reads only magics and
+/// headers), so nearly all of the assembly cost is this copy; for large outputs the
+/// segments land in disjoint slices of one pre-sized allocation in parallel.
+fn stitch(segments: Vec<Segment>) -> Vec<u8> {
+    let total: usize = segments.iter().map(|s| s.bytes().len()).sum();
+    let mut out: Vec<u8> = Vec::with_capacity(total);
+
+    // Small outputs: rayon overhead outweighs the copy.
+    if total < (1 << 22) || segments.len() < 2 {
+        for s in &segments {
+            out.extend_from_slice(s.bytes());
+        }
+        return out;
+    }
+
+    // Carve the spare capacity into one disjoint `&mut` slice per segment.
+    let mut spare: &mut [MaybeUninit<u8>] = &mut out.spare_capacity_mut()[..total];
+    let mut slots: Vec<&mut [MaybeUninit<u8>]> = Vec::with_capacity(segments.len());
+    for s in &segments {
+        let (head, rest) = spare.split_at_mut(s.bytes().len());
+        slots.push(head);
+        spare = rest;
+    }
+    segments
+        .par_iter()
+        .zip(slots)
+        .for_each(|(seg, slot)| unsafe {
+            let src = seg.bytes();
+            core::ptr::copy_nonoverlapping(src.as_ptr(), slot.as_mut_ptr() as *mut u8, src.len());
+        });
+    // Safety: the slots partition `0..total` and every byte was written above.
+    unsafe { out.set_len(total) };
+    out
+}
+
 /// Walk the stream structure, splicing in already-decoded blocks where the chain
 /// confirms them and falling back to serial everywhere else. Returns the plaintext
 /// and how many blocks the fast path accepted, which the tests use to prove the fast
 /// path is doing the work rather than quietly deferring to serial.
 fn assemble(input: &[u8], mut blocks: BTreeMap<usize, Decoded>) -> Result<(Vec<u8>, usize), Error> {
     let mut accepted = 0usize;
-    let mut out = Vec::new();
+    let mut segments: Vec<Segment> = Vec::new();
     let mut bit = 0usize;
     let mut block_size = 0usize;
     let mut combined_crc = 0u32;
     // Mirrors `BlockDecoder::phase`; the two are kept in step so a fallback can hand
     // the serial decoder the exact state the fast path had reached.
     let mut at_stream_start = true;
+
+    // Every fallback decodes serially to the end of the input, so it is always the
+    // final segment.
+    let fall_back = |bit: usize, phase: Phase, block_size: usize, crc: u32| {
+        let mut tail = Vec::new();
+        finish_serially(input, bit, phase, block_size, crc, &mut tail).map(|()| tail)
+    };
 
     loop {
         let mut bits = BitCursor::new(input, bit);
@@ -207,7 +324,7 @@ fn assemble(input: &[u8], mut blocks: BTreeMap<usize, Decoded>) -> Result<(Vec<u
             bits.align_to_byte();
             if bits.bytes_left() == 0 {
                 // Clean end of input at a stream boundary, exactly as serial.
-                return Ok((out, accepted));
+                return Ok((stitch(segments), accepted));
             }
             let header = (|| {
                 if bits.bytes_left() < 4 {
@@ -231,8 +348,8 @@ fn assemble(input: &[u8], mut blocks: BTreeMap<usize, Decoded>) -> Result<(Vec<u
                 }
                 None => {
                     // Malformed header: let the serial decoder name the error.
-                    finish_serially(input, bit, Phase::StreamStart, 0, 0, &mut out)?;
-                    return Ok((out, accepted));
+                    segments.push(Segment::Serial(fall_back(bit, Phase::StreamStart, 0, 0)?));
+                    return Ok((stitch(segments), accepted));
                 }
             }
             continue;
@@ -241,8 +358,13 @@ fn assemble(input: &[u8], mut blocks: BTreeMap<usize, Decoded>) -> Result<(Vec<u
         let magic = match bits.read_magic() {
             Ok(m) => m,
             Err(_) => {
-                finish_serially(input, bit, Phase::Block, block_size, combined_crc, &mut out)?;
-                return Ok((out, accepted));
+                segments.push(Segment::Serial(fall_back(
+                    bit,
+                    Phase::Block,
+                    block_size,
+                    combined_crc,
+                )?));
+                return Ok((stitch(segments), accepted));
             }
         };
 
@@ -253,54 +375,119 @@ fn assemble(input: &[u8], mut blocks: BTreeMap<usize, Decoded>) -> Result<(Vec<u
             // what `decode_block` does.
             match blocks.remove(&bit) {
                 Some(d) if d.nblock <= block_size => {
-                    out.extend_from_slice(&d.out);
                     combined_crc = combined_crc.rotate_left(1) ^ d.crc;
                     bit = d.end_bit;
                     accepted += 1;
+                    segments.push(Segment::Fast(d));
                 }
                 _ => {
-                    finish_serially(input, bit, Phase::Block, block_size, combined_crc, &mut out)?;
-                    return Ok((out, accepted));
+                    segments.push(Segment::Serial(fall_back(
+                        bit,
+                        Phase::Block,
+                        block_size,
+                        combined_crc,
+                    )?));
+                    return Ok((stitch(segments), accepted));
                 }
             }
         } else if magic == EOS_MAGIC {
             let stored = bits.read_bits(32);
             if stored != Ok(combined_crc) {
-                finish_serially(input, bit, Phase::Block, block_size, combined_crc, &mut out)?;
-                return Ok((out, accepted));
+                segments.push(Segment::Serial(fall_back(
+                    bit,
+                    Phase::Block,
+                    block_size,
+                    combined_crc,
+                )?));
+                return Ok((stitch(segments), accepted));
             }
             at_stream_start = true;
             bit = bits.bit;
         } else {
-            finish_serially(input, bit, Phase::Block, block_size, combined_crc, &mut out)?;
-            return Ok((out, accepted));
+            segments.push(Segment::Serial(fall_back(
+                bit,
+                Phase::Block,
+                block_size,
+                combined_crc,
+            )?));
+            return Ok((stitch(segments), accepted));
         }
     }
 }
 
 /// The plaintext, plus how many blocks came from the thread pool rather than from a
-/// serial fallback.
+/// serial fallback. Only tests call this directly — production goes through
+/// [`decode_auto`] — but it stays a real function so the suite can prove the fast
+/// path on arbitrarily small streams.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn decode(input: &[u8]) -> Result<(Vec<u8>, usize), Error> {
+    decode_impl(input, 0)
+}
+
+/// [`decode`], but handing streams of fewer than `min_candidates` likely blocks to
+/// the serial decoder. With one or two blocks the pipelined serial path already
+/// overlaps everything the pool could overlap — the walks interleave on one core
+/// and are latency- rather than throughput-bound — without paying scheduling and
+/// thread wake-up on the critical path. The public entry uses this; tests call
+/// [`decode`] directly so the fast path stays proven on small streams too.
+pub(crate) fn decode_auto(input: &[u8]) -> Result<(Vec<u8>, usize), Error> {
+    decode_impl(input, 3)
+}
+
+// Per-worker scratch that outlives any one call: pool threads persist, so the
+// multi-megabyte BWT buffers stay allocated (and their pages stay faulted in)
+// across blocks *and* across `decompress_parallel` calls. Two decoders because
+// candidates are speculated in pairs with interleaved walks; the `Vec` is the
+// pipelined serial decoder's side buffer.
+std::thread_local! {
+    static SCRATCH: core::cell::RefCell<(BlockDecoder, BlockDecoder, Vec<u8>)> =
+        core::cell::RefCell::new((BlockDecoder::new(), BlockDecoder::new(), Vec::new()));
+}
+
+fn decode_impl(input: &[u8], min_candidates: usize) -> Result<(Vec<u8>, usize), Error> {
     let candidates = scan_candidates(input);
 
     // A real block header is well over a hundred bits, so a legitimate stream has
     // orders of magnitude fewer candidates than this. An input deliberately stuffed
     // with the magic would otherwise buy unbounded speculative work; serial decode of
     // it is both correct and cheaper.
-    if candidates.is_empty() || candidates.len() > input.len() / 16 + 64 {
-        return Ok((crate::decompress_to_vec(input)?, 0));
+    if candidates.is_empty()
+        || candidates.len() < min_candidates
+        || candidates.len() > input.len() / 16 + 64
+    {
+        let out = SCRATCH.with(|cell| {
+            let (a, b, tmp) = &mut *cell.borrow_mut();
+            crate::decompress_to_vec_with(a, b, tmp, input)
+        })?;
+        return Ok((out, 0));
     }
-
-    let decoded: Vec<Option<Decoded>> = candidates
-        .par_iter()
-        .map(|&start| speculate(input, start))
+    // Interleaved pair decode halves the task count, so only pair when there are
+    // still several tasks per worker — otherwise (few blocks) pairing costs more
+    // occupancy than the overlapped walks win back.
+    let chunk = if candidates.len() >= 4 * rayon::current_num_threads() {
+        2
+    } else {
+        1
+    };
+    let decoded: Vec<(Option<Decoded>, Option<Decoded>)> = candidates
+        .par_chunks(chunk)
+        .map(|pair| {
+            SCRATCH.with(|cell| {
+                let (a, b, _) = &mut *cell.borrow_mut();
+                speculate_pair(a, b, input, pair[0], pair.get(1).copied())
+            })
+        })
         .collect();
 
-    let blocks: BTreeMap<usize, Decoded> = candidates
-        .iter()
-        .zip(decoded)
-        .filter_map(|(&start, d)| d.map(|d| (start, d)))
-        .collect();
+    let mut blocks: BTreeMap<usize, Decoded> = BTreeMap::new();
+    for (pair, (da, db)) in candidates.chunks(chunk).zip(decoded) {
+        if let Some(d) = da {
+            blocks.insert(pair[0], d);
+        }
+        if let (Some(&start), Some(d)) = (pair.get(1), db) {
+            blocks.insert(start, d);
+        }
+    }
 
     assemble(input, blocks)
 }
@@ -315,8 +502,9 @@ pub(crate) fn decode(input: &[u8]) -> Result<(Vec<u8>, usize), Error> {
 /// of input at level 9) has nothing to parallelize and costs the same as serial.
 ///
 /// `threads` selects the pool: `None` uses rayon's global pool (one worker per core),
-/// `Some(1)` decodes serially on the calling thread, and `Some(n)` builds a private
-/// pool of `n` threads for this call.
+/// `Some(1)` decodes serially on the calling thread, and `Some(n)` uses a private
+/// pool of `n` threads. Private pools are built once per distinct `n` and cached for
+/// the life of the process, so repeated calls do not pay thread spawn-up again.
 ///
 /// Peak memory is the whole plaintext, as with `decompress`, plus the blocks decoded
 /// ahead of the chain.
@@ -335,15 +523,26 @@ pub(crate) fn decode(input: &[u8]) -> Result<(Vec<u8>, usize), Error> {
 pub fn decompress_parallel(compressed: &[u8], threads: Option<usize>) -> io::Result<Vec<u8>> {
     match threads {
         Some(1) => crate::decompress(compressed),
-        None | Some(0) => Ok(decode(compressed)?.0),
+        None | Some(0) => Ok(decode_auto(compressed)?.0),
         Some(n) => {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(n)
-                .build()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            Ok(pool.install(|| decode(compressed))?.0)
+            let pool = pool_for(n).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            Ok(pool.install(|| decode_auto(compressed))?.0)
         }
     }
+}
+
+/// The cached private pool for `n` threads, built on first use. `Mutex<Option<..>>`
+/// rather than `OnceLock` to hold the crate's 1.63 MSRV.
+fn pool_for(n: usize) -> Result<Arc<rayon::ThreadPool>, rayon::ThreadPoolBuildError> {
+    static POOLS: Mutex<Option<BTreeMap<usize, Arc<rayon::ThreadPool>>>> = Mutex::new(None);
+    let mut guard = POOLS.lock().unwrap_or_else(|e| e.into_inner());
+    let pools = guard.get_or_insert_with(BTreeMap::new);
+    if let Some(pool) = pools.get(&n) {
+        return Ok(Arc::clone(pool));
+    }
+    let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(n).build()?);
+    pools.insert(n, Arc::clone(&pool));
+    Ok(pool)
 }
 
 #[cfg(test)]
@@ -389,5 +588,57 @@ mod tests {
     fn scanner_reports_no_candidate_in_empty_or_tiny_input() {
         assert!(scan_candidates(&[]).is_empty());
         assert!(scan_candidates(&[0x31, 0x41, 0x59]).is_empty());
+    }
+
+    /// Dev experiment, not a correctness test: times two sequential walks against
+    /// one interleaved pair walk on latency-hostile (pseudo-random) blocks.
+    /// `cargo test --release --features parallel pair_walk_overlap -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn pair_walk_overlap() {
+        // Word-salad plaintext: compressible but with no BWT walk locality.
+        let mut plain = Vec::new();
+        let words: &[&[u8]] = &[
+            b"alpha", b"bravo", b"charlie", b"delta", b"echo", b"foxtrot", b"golf", b"hotel",
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        while plain.len() < 2_000_000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            plain.extend_from_slice(words[(state >> 33) as usize % words.len()]);
+            plain.push(b' ');
+        }
+        let packed = crate::compress(&plain, crate::Level::BEST);
+        let starts = scan_candidates(&packed);
+        assert!(starts.len() >= 2, "need two blocks, got {}", starts.len());
+
+        let mut a = BlockDecoder::new();
+        let mut b = BlockDecoder::new();
+        let pa = prepare_speculative(&mut a, &packed, starts[0]).unwrap();
+        let pb = prepare_speculative(&mut b, &packed, starts[1]).unwrap();
+
+        for round in 0..3 {
+            let mut out_a = Vec::new();
+            let mut out_b = Vec::new();
+            let t = std::time::Instant::now();
+            let ca = crate::WalkCursor::begin(&a.tt, pa.1, &mut out_a).finish();
+            let cb = crate::WalkCursor::begin(&b.tt, pb.1, &mut out_b).finish();
+            let sequential = t.elapsed();
+
+            let mut out_a2 = Vec::new();
+            let mut out_b2 = Vec::new();
+            let t = std::time::Instant::now();
+            let (ca2, cb2) = walk_pair(
+                crate::WalkCursor::begin(&a.tt, pa.1, &mut out_a2),
+                crate::WalkCursor::begin(&b.tt, pb.1, &mut out_b2),
+            );
+            let paired = t.elapsed();
+
+            assert_eq!((ca, cb), (ca2, cb2));
+            assert_eq!(out_a, out_a2);
+            assert_eq!(out_b, out_b2);
+            eprintln!("round {round}: sequential {sequential:?} vs paired {paired:?}");
+        }
     }
 }

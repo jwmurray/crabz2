@@ -13,7 +13,7 @@ OUT=bench_multi.csv
 echo "input_mb,crabz2_mb_s,libbz2_mb_s,bzip2_mb_s,parallel_bzip2_mb_s,parallel_cmd,threads,plain_bytes,num_blocks" > "$OUT"
 
 THREADS=8
-ITERS=3
+ITERS=5
 
 # detect parallel bzip2 implementations for a multi-threaded C baseline
 PBZIP=$(command -v pbzip2 || true)

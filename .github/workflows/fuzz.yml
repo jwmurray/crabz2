@@ -43,7 +43,9 @@ jobs:
           key: fuzz-${{ runner.os }}-${{ hashFiles('fuzz/Cargo.toml') }}
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        # --force: a restored cache can already hold the binary, and a plain
+        # install then fails with "binary `cargo-fuzz` already exists".
+        run: cargo install cargo-fuzz --locked --force
 
       - name: Smoke run — fuzz_decompress
         run: >
