@@ -173,7 +173,12 @@ fn prepare_speculative(
 /// Finish one prepared block: walk it (producing `out`) and check the data against
 /// the stored CRC. A mismatch yields `None`, exactly as the serial decoder would
 /// refuse the block.
-fn accept(prep: Option<(u32, usize, usize)>, crc: u32, out: Vec<u8>, dec: &BlockDecoder) -> Option<Decoded> {
+fn accept(
+    prep: Option<(u32, usize, usize)>,
+    crc: u32,
+    out: Vec<u8>,
+    dec: &BlockDecoder,
+) -> Option<Decoded> {
     let (block_crc, _, end_bit) = prep?;
     if crc != block_crc {
         return None;

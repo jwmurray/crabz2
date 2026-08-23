@@ -407,17 +407,16 @@ impl HuffTable {
             }
         }
 
-        let mut base = [0i32; MAX_CODE_LEN + 2];
+        // Cumulative symbol counts by code length: `counts[l]` is the perm index of
+        // the first symbol with length `l`. `base` starts as a copy and is then
+        // repurposed as the canonical decode offset.
+        let mut counts = [0i32; MAX_CODE_LEN + 2];
         for &sl in len {
-            base[sl as usize + 1] += 1;
+            counts[sl as usize + 1] += 1;
         }
-        for i in 1..base.len() {
-            base[i] += base[i - 1];
+        for i in 1..counts.len() {
+            counts[i] += counts[i - 1];
         }
-
-        // Per-length symbol counts and starting perm index, before `base` is
-        // repurposed as the decode offset below.
-        let counts = base;
         let mut base = counts;
 
         let mut limit = [0i32; MAX_CODE_LEN + 2];
@@ -817,8 +816,8 @@ impl BlockDecoder {
 
         #[cfg(feature = "phasetime")]
         _pt.lap(0); // header + selectors + tables
-        // MTF + RLE2 decode into the BWT byte buffer (the last column, one byte per
-        // cell — denser than decoding straight into `tt`, and run fills are memsets).
+                    // MTF + RLE2 decode into the BWT byte buffer (the last column, one byte per
+                    // cell — denser than decoding straight into `tt`, and run fills are memsets).
         self.bytes.clear();
         // Avoid reallocations for the common case by reserving the declared block size.
         self.bytes.reserve(self.block_size);
@@ -972,7 +971,9 @@ impl BlockDecoder {
         self.tt.clear();
         self.tt.reserve(nblock);
         // Safety: every cell in `0..nblock` is written exactly once below — `cftab`
-        // partitions `0..nblock` into per-byte ranges and each write consumes one slot.
+        // partitions `0..nblock` into per-byte ranges and each write consumes one
+        // slot — and nothing reads `tt` until after this loop.
+        #[allow(clippy::uninit_vec)]
         unsafe {
             self.tt.set_len(nblock);
             let bp = self.bytes.as_ptr();
