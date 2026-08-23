@@ -1117,10 +1117,27 @@ fn walk_pair(mut a: WalkCursor<'_>, mut b: WalkCursor<'_>) -> (u32, u32) {
 /// permutation walks — each a serial dependent-load chain, and the majority of
 /// decode time — overlap in the memory system.
 pub fn decompress_to_vec(compressed: &[u8]) -> Result<Vec<u8>, Error> {
-    let mut a = BlockDecoder::new();
-    let mut b = BlockDecoder::new();
+    decompress_to_vec_with(
+        &mut BlockDecoder::new(),
+        &mut BlockDecoder::new(),
+        &mut Vec::new(),
+        compressed,
+    )
+}
+
+/// [`decompress_to_vec`] over caller-owned scratch, so a caller that decodes many
+/// buffers (or the parallel front end handling a small stream) keeps the
+/// multi-megabyte block buffers allocated and their pages faulted in.
+pub(crate) fn decompress_to_vec_with(
+    a: &mut BlockDecoder,
+    b: &mut BlockDecoder,
+    tmp: &mut Vec<u8>,
+    compressed: &[u8],
+) -> Result<Vec<u8>, Error> {
+    a.bit = 0;
+    a.phase = Phase::StreamStart;
+    a.combined_crc = 0;
     let mut out = Vec::new();
-    let mut tmp: Vec<u8> = Vec::new();
     loop {
         match a.prepare_next(compressed)? {
             Prepared::Eof => return Ok(out),

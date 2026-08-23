@@ -434,6 +434,16 @@ pub(crate) fn decode_auto(input: &[u8]) -> Result<(Vec<u8>, usize), Error> {
     decode_impl(input, 3)
 }
 
+// Per-worker scratch that outlives any one call: pool threads persist, so the
+// multi-megabyte BWT buffers stay allocated (and their pages stay faulted in)
+// across blocks *and* across `decompress_parallel` calls. Two decoders because
+// candidates are speculated in pairs with interleaved walks; the `Vec` is the
+// pipelined serial decoder's side buffer.
+std::thread_local! {
+    static SCRATCH: core::cell::RefCell<(BlockDecoder, BlockDecoder, Vec<u8>)> =
+        core::cell::RefCell::new((BlockDecoder::new(), BlockDecoder::new(), Vec::new()));
+}
+
 fn decode_impl(input: &[u8], min_candidates: usize) -> Result<(Vec<u8>, usize), Error> {
     let candidates = scan_candidates(input);
 
@@ -445,16 +455,11 @@ fn decode_impl(input: &[u8], min_candidates: usize) -> Result<(Vec<u8>, usize), 
         || candidates.len() < min_candidates
         || candidates.len() > input.len() / 16 + 64
     {
-        return Ok((crate::decompress_to_vec(input)?, 0));
-    }
-
-    // Per-worker scratch that outlives this call: pool threads persist, so the
-    // multi-megabyte BWT buffers stay allocated (and their pages stay faulted in)
-    // across blocks *and* across `decompress_parallel` calls. Two decoders per
-    // worker because candidates are speculated in pairs with interleaved walks.
-    std::thread_local! {
-        static SCRATCH: core::cell::RefCell<(BlockDecoder, BlockDecoder)> =
-            core::cell::RefCell::new((BlockDecoder::new(), BlockDecoder::new()));
+        let out = SCRATCH.with(|cell| {
+            let (a, b, tmp) = &mut *cell.borrow_mut();
+            crate::decompress_to_vec_with(a, b, tmp, input)
+        })?;
+        return Ok((out, 0));
     }
     // Interleaved pair decode halves the task count, so only pair when there are
     // still several tasks per worker — otherwise (few blocks) pairing costs more
@@ -468,7 +473,7 @@ fn decode_impl(input: &[u8], min_candidates: usize) -> Result<(Vec<u8>, usize), 
         .par_chunks(chunk)
         .map(|pair| {
             SCRATCH.with(|cell| {
-                let (a, b) = &mut *cell.borrow_mut();
+                let (a, b, _) = &mut *cell.borrow_mut();
                 speculate_pair(a, b, input, pair[0], pair.get(1).copied())
             })
         })
