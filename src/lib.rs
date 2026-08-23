@@ -1039,16 +1039,24 @@ impl<'a> WalkCursor<'a> {
         }
     }
 
-    /// # Safety
-    /// At most `rem` total calls, with `rem` decremented by the caller per call.
-    #[inline(always)]
-    unsafe fn step(&mut self) {
+    /// Ensure room for at least one worst-case (255-byte) step and return how many
+    /// such steps are guaranteed to fit — the size of an inner loop that can run
+    /// with no capacity checks at all.
+    fn grow(&mut self) -> usize {
         if self.room < 256 {
-            self.out.set_len(self.len);
+            unsafe { self.out.set_len(self.len) };
             self.out.reserve(self.rem.max(4096));
-            self.dst = self.out.as_mut_ptr().add(self.len);
+            self.dst = self.out.as_mut_ptr().wrapping_add(self.len);
             self.room = self.out.capacity() - self.len;
         }
+        (self.room >> 8).min(self.rem)
+    }
+
+    /// # Safety
+    /// Only within a [`grow`](WalkCursor::grow)-bounded chunk: at most the returned
+    /// number of calls, with `rem` decremented by the caller per chunk.
+    #[inline(always)]
+    unsafe fn step_unchecked(&mut self) {
         let b = (self.t_pos & 0xff) as u8;
         self.t_pos = *self.tt.add((self.t_pos >> 8) as usize);
 
@@ -1083,9 +1091,14 @@ impl<'a> WalkCursor<'a> {
         #[cfg(feature = "phasetime")]
         let mut _pt = phasetime::Scope::new();
         unsafe {
+            // Chunked: `grow` guarantees room for `chunk` worst-case steps, so the
+            // inner loop carries no capacity check at all.
             while self.rem > 0 {
-                self.step();
-                self.rem -= 1;
+                let chunk = self.grow();
+                for _ in 0..chunk {
+                    self.step_unchecked();
+                }
+                self.rem -= chunk;
             }
             self.out.set_len(self.len);
         }
@@ -1100,10 +1113,13 @@ impl<'a> WalkCursor<'a> {
 fn walk_pair(mut a: WalkCursor<'_>, mut b: WalkCursor<'_>) -> (u32, u32) {
     unsafe {
         while a.rem > 0 && b.rem > 0 {
-            a.step();
-            b.step();
-            a.rem -= 1;
-            b.rem -= 1;
+            let chunk = a.grow().min(b.grow()).min(a.rem).min(b.rem);
+            for _ in 0..chunk {
+                a.step_unchecked();
+                b.step_unchecked();
+            }
+            a.rem -= chunk;
+            b.rem -= chunk;
         }
     }
     (a.finish(), b.finish())
@@ -1138,7 +1154,17 @@ pub(crate) fn decompress_to_vec_with(
     a.phase = Phase::StreamStart;
     a.combined_crc = 0;
     let mut out = Vec::new();
+    let mut estimated = false;
     loop {
+        // After the first block lands, extrapolate the total output size from the
+        // fraction of input consumed and reserve it once, instead of letting the
+        // output vector double its way up with a realloc-copy each time.
+        if !estimated && !out.is_empty() && a.bit > 0 {
+            estimated = true;
+            let est = (out.len() as u64).saturating_mul(compressed.len() as u64 * 8) / a.bit as u64;
+            let est = est as usize + (est as usize >> 4);
+            out.reserve(est.saturating_sub(out.len()));
+        }
         match a.prepare_next(compressed)? {
             Prepared::Eof => return Ok(out),
             Prepared::Block {

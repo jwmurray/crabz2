@@ -107,8 +107,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         lib_times.push(secs);
     }
 
-    let crab_avg: f64 = crab_times.iter().sum::<f64>() / crab_times.len() as f64;
-    let lib_avg: f64 = lib_times.iter().sum::<f64>() / lib_times.len() as f64;
+    // Median, not mean: scheduling noise only ever slows a run down, so the mean
+    // is biased by outliers — equally for both implementations, but needlessly.
+    let median = |times: &[f64]| -> f64 {
+        let mut sorted = times.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted[sorted.len() / 2]
+    };
+    let crab_avg: f64 = median(&crab_times);
+    let lib_avg: f64 = median(&lib_times);
 
     let plain_mb = human_mb(plain_len_c);
     eprintln!("\nSummary ({} iterations):", iters);
