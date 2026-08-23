@@ -316,15 +316,24 @@ impl HuffTable {
 
     #[inline]
     fn decode(&self, bits: &mut BitCursor<'_>) -> Result<usize, Error> {
-        let mut l = self.min_len;
-        let mut v = bits.read_bits(l)? as i32;
-        while l <= self.max_len {
-            if v <= self.limit[l as usize] {
-                let idx = (v - self.base[l as usize]) as usize;
+        // Local copies to avoid repeated field access and to help the compiler
+        // optimize the hot decode loop. We do one checked bounds test and then
+        // use unchecked indexing for the actual lookup to avoid per-iteration
+        // bounds checks on `perm`.
+        let mut l = self.min_len as usize;
+        let max_len = self.max_len as usize;
+        let mut v = bits.read_bits(l as u32)? as i32;
+        // Safety: we will check `idx` before performing unchecked access.
+        while l <= max_len {
+            let limit_l = self.limit[l];
+            if v <= limit_l {
+                let idx = (v - self.base[l]) as usize;
                 if idx >= self.perm.len() {
                     return Err(Error::InvalidHuffman);
                 }
-                return Ok(self.perm[idx]);
+                unsafe {
+                    return Ok(*self.perm.get_unchecked(idx));
+                }
             }
             l += 1;
             v = (v << 1) | bits.read_bit()? as i32;

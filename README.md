@@ -132,17 +132,18 @@ costs what serial costs. Reproduce with the example CLI:
 cargo run --release --features parallel --example parallel -- file.bz2 8 > /dev/null
 ```
 
+
 ## Multi-bench script results
 
 The `scripts/run_bench_multi.sh` script writes a CSV named [bench_multi.csv](bench_multi.csv). The most recent run produced these numbers (MB/s of plaintext out):
 
-| Input MB | crabz2 MB/s | libbz2 MB/s | bzip2 MB/s | threads |
-|---:|---:|---:|---:|---:|
-| 1 | 205.5 | 256.5 | 162.8 | 8 |
-| 5 | 924.6 | 276.0 | 244.1 | 8 |
-| 10 | 1180.5 | 317.4 | 297.1 | 8 |
-| 50 | 1666.6 | 335.6 | 329.9 | 8 |
-| 100 | 1653.6 | 329.0 | 322.1 | 8 |
+| Input MB | crabz2 MB/s | libbz2 MB/s | bzip2 MB/s | parallel MB/s | parallel cmd | threads |
+|---:|---:|---:|---:|---:|---|---:|
+| 1 | 195.1 | 229.7 | 144.5 | 112.1 | /opt/homebrew/bin/lbzip2 | 8 |
+| 5 | 1007.1 | 312.5 | 264.2 | 711.1 | /opt/homebrew/bin/lbzip2 | 8 |
+| 10 | 1183.5 | 323.1 | 311.5 | 955.4 | /opt/homebrew/bin/lbzip2 | 8 |
+| 50 | 1643.6 | 339.6 | 331.6 | 1854.6 | /opt/homebrew/bin/lbzip2 | 8 |
+| 100 | 1719.5 | 336.2 | 346.5 | 1868.0 | /opt/homebrew/bin/lbzip2 | 8 |
 
 See `scripts/run_bench_multi.sh` for how the measurements were collected.
 
