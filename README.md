@@ -5,6 +5,13 @@
 Pure-Rust **bzip2 compression and decompression** — no C, no bundled `libbz2`, no
 third-party bzip2 crate. 🦀
 
+**Faster than the C implementations in our decode benchmarks.** On the
+multi-size benchmark below, `crabz2` beats C `libbz2` (via the `bzip2` crate), the
+system `bzip2` binary, and parallel `lbzip2` at every input size from 1 MB to
+100 MB — up to **6.6x** libbz2's throughput at 100 MB:
+
+![Decode throughput: crabz2 vs libbz2, bzip2, and lbzip2](https://raw.githubusercontent.com/jwmurray/crabz2/main/docs/bench_multi.svg)
+
 `crabz2` implements both bzip2 pipelines itself, with **zero dependencies**:
 
 - **decode** — bit reader → Huffman → MTF/RLE2 → inverse Burrows–Wheeler transform →
@@ -20,7 +27,8 @@ the piece the ecosystem was missing.
 
 | Version | What it ships |
 |---|---|
-| **0.4.0** (now) | The full format in pure Rust. Pure-Rust **encoder** — `compress`, `Crabz2Writer`, levels 1–9, verified against system `bzip2`. Decoder behind a sans-io state machine: `no_std + alloc` core, `wasm32-unknown-unknown` and a bare-metal target checked in CI. Non-default `parallel` feature for multi-core decode. The [`crabz2-wasm`](crabz2-wasm/) npm package (`npm install crabz2`) with a streaming JS API and a [live browser demo](https://jwmurray.github.io/crabz2/). Criterion benchmarks vs libbz2 below. |
+| **0.5.0** (now) | Decode hot path rewritten from profiling: write-only IBWT threading, interleaved pair walks (software-pipelined serially, paired speculation in parallel), fast-table Huffman over a 64-bit bit reservoir, arena MTF, cached thread pools, parallel output assembly. Decode now **beats C libbz2 single-threaded and lbzip2 in parallel at every benchmarked size**. |
+| 0.4.0 | The full format in pure Rust. Pure-Rust **encoder** — `compress`, `Crabz2Writer`, levels 1–9, verified against system `bzip2`. Decoder behind a sans-io state machine: `no_std + alloc` core, `wasm32-unknown-unknown` and a bare-metal target checked in CI. Non-default `parallel` feature for multi-core decode. The [`crabz2-wasm`](crabz2-wasm/) npm package (`npm install crabz2`) with a streaming JS API and a [live browser demo](https://jwmurray.github.io/crabz2/). Criterion benchmarks vs libbz2 below. |
 | 0.3.1 | The 0.2 decoder, hardened against crafted RLE2 run lengths, with a `cargo-fuzz` target. |
 | 0.2 | Own from-scratch, dependency-free streaming decoder. Verified byte-for-byte against `bzip2`. |
 | 0.1 | Thin wrapper over `bzip2-rs` (superseded; `0.1.0` remains dual `MIT OR Apache-2.0`). |
@@ -135,7 +143,11 @@ cargo run --release --features parallel --example parallel -- file.bz2 8 > /dev/
 
 ## Multi-bench script results
 
-The `scripts/run_bench_multi.sh` script writes a CSV named [bench_multi.csv](bench_multi.csv). The most recent run produced these numbers (MB/s of plaintext out):
+The `scripts/run_bench_multi.sh` script writes a CSV named [bench_multi.csv](bench_multi.csv)
+and is the source of the chart above ([docs/bench_multi.svg](docs/bench_multi.svg)).
+The most recent run produced these numbers (MB/s of plaintext out) — **crabz2 is the
+fastest column at every size**, against both single-threaded C (`libbz2`, `bzip2`)
+and parallel C (`lbzip2 -n 8`):
 
 | Input MB | crabz2 MB/s | libbz2 MB/s | bzip2 MB/s | parallel MB/s | parallel cmd | threads |
 |---:|---:|---:|---:|---:|---|---:|

@@ -1,10 +1,10 @@
 [package]
 name = "crabz2"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.63"
 license = "MIT"
-description = "Pure-Rust bzip2 compression and decompression — own from-scratch encoder and decoder, no C, no libbz2, no third-party bzip2 crate."
+description = "Pure-Rust bzip2 compression and decompression — no C, no libbz2, no third-party bzip2 crate — with a decoder that beats C libbz2 (and parallel lbzip2) in our benchmarks."
 repository = "https://github.com/jwmurray/crabz2"
 homepage = "https://github.com/jwmurray/crabz2"
 readme = "README.md"
