@@ -132,6 +132,20 @@ costs what serial costs. Reproduce with the example CLI:
 cargo run --release --features parallel --example parallel -- file.bz2 8 > /dev/null
 ```
 
+## Multi-bench script results
+
+The `scripts/run_bench_multi.sh` script writes a CSV named [bench_multi.csv](bench_multi.csv). The most recent run produced these numbers (MB/s of plaintext out):
+
+| Input MB | crabz2 MB/s | libbz2 MB/s | bzip2 MB/s | threads |
+|---:|---:|---:|---:|---:|
+| 1 | 205.5 | 256.5 | 162.8 | 8 |
+| 5 | 924.6 | 276.0 | 244.1 | 8 |
+| 10 | 1180.5 | 317.4 | 297.1 | 8 |
+| 50 | 1666.6 | 335.6 | 329.9 | 8 |
+| 100 | 1653.6 | 329.0 | 322.1 | 8 |
+
+See `scripts/run_bench_multi.sh` for how the measurements were collected.
+
 **Not offered on wasm.** `parallel` needs OS threads; enabling it for a `wasm` target
 is a `compile_error!` rather than a runtime surprise.
 
