@@ -24,6 +24,7 @@ members = [".", "crabz2-wasm"]
 # Intentionally empty: a default build of crabz2 has no runtime dependencies. The
 # one optional dependency is declared in its own table below so this stays visibly so.
 [dependencies]
+bzip2 = { version = "0.4", optional = true }
 
 # Pulled in only by the non-default `parallel` feature. 1.10 is the last release
 # with rayon's own MSRV at 1.63, matching ours; newer minors resolve fine on newer
@@ -61,6 +62,9 @@ std = []
 # default — with it off the serial decoder compiles exactly as it does today.
 parallel = ["dep:rayon", "std"]
 
+# Optional C-backed libbz2 baseline used by the `examples/compare.rs` example.
+libbz2 = ["bzip2"]
+
 # The examples are std-only CLIs; skip them under --no-default-features.
 [[example]]
 name = "crabz2"
@@ -73,3 +77,7 @@ required-features = ["std"]
 [[example]]
 name = "parallel"
 required-features = ["parallel"]
+
+[[example]]
+name = "compare"
+required-features = ["libbz2", "parallel"]
