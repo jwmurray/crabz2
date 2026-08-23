@@ -76,6 +76,7 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
+use core::ptr;
 
 #[cfg(feature = "std")]
 use std::io::{self, Read, Write};
@@ -93,6 +94,52 @@ const BLOCK_MAGIC: u64 = 0x3141_5926_5359; // pi digits
 const EOS_MAGIC: u64 = 0x1772_4538_5090; // sqrt(pi) digits
 const MAX_CODE_LEN: usize = 23;
 const GROUP_SIZE: usize = 50;
+
+/// Temporary Phase-A instrumentation: per-phase wall time inside `decode_block`,
+/// accumulated globally and printed via [`phasetime::report`]. Dev-only.
+#[cfg(feature = "phasetime")]
+pub mod phasetime {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    pub static ACC: [AtomicU64; 4] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    pub const NAMES: [&str; 4] = [
+        "header/selectors/tables",
+        "huffman+MTF+RLE2",
+        "cftab+threading",
+        "walk+RLE1+CRC",
+    ];
+
+    pub struct Scope {
+        last: Instant,
+    }
+    impl Scope {
+        pub fn new() -> Self {
+            Scope {
+                last: Instant::now(),
+            }
+        }
+        pub fn lap(&mut self, phase: usize) {
+            let now = Instant::now();
+            let ns = now.duration_since(self.last).as_nanos() as u64;
+            ACC[phase].fetch_add(ns, Ordering::Relaxed);
+            self.last = now;
+        }
+    }
+
+    pub fn take() -> [f64; 4] {
+        let mut out = [0.0; 4];
+        for (i, a) in ACC.iter().enumerate() {
+            out[i] = a.swap(0, Ordering::Relaxed) as f64 / 1e9;
+        }
+        out
+    }
+}
 
 /// Everything the decoder can reject. Structural, not positional: a corrupt stream
 /// names the invariant it broke, never a byte offset the caller cannot act on.
@@ -179,6 +226,45 @@ const CRC_TABLE: [u32; 256] = {
 #[inline]
 fn crc_update(crc: u32, byte: u8) -> u32 {
     (crc << 8) ^ CRC_TABLE[(((crc >> 24) ^ byte as u32) & 0xff) as usize]
+}
+
+/// Slicing-by-8 tables: `CRC_TABLES[0]` is `CRC_TABLE`, and `CRC_TABLES[k]` maps a
+/// byte to its CRC contribution from `k` positions earlier in an 8-byte word.
+const CRC_TABLES: [[u32; 256]; 8] = {
+    let mut tables = [[0u32; 256]; 8];
+    tables[0] = CRC_TABLE;
+    let mut k = 1;
+    while k < 8 {
+        let mut n = 0;
+        while n < 256 {
+            let prev = tables[k - 1][n];
+            tables[k][n] = (prev << 8) ^ CRC_TABLE[(prev >> 24) as usize];
+            n += 1;
+        }
+        k += 1;
+    }
+    tables
+};
+
+/// CRC-32/BZIP2 over a whole buffer, slicing-by-8. Bitwise-identical to folding
+/// every byte through [`crc_update`], but the dependent chain advances eight bytes
+/// per step instead of one.
+fn crc_buffer(mut crc: u32, data: &[u8]) -> u32 {
+    let mut chunks = data.chunks_exact(8);
+    for w in &mut chunks {
+        crc = CRC_TABLES[7][(w[0] ^ (crc >> 24) as u8) as usize]
+            ^ CRC_TABLES[6][(w[1] ^ (crc >> 16) as u8) as usize]
+            ^ CRC_TABLES[5][(w[2] ^ (crc >> 8) as u8) as usize]
+            ^ CRC_TABLES[4][(w[3] ^ crc as u8) as usize]
+            ^ CRC_TABLES[3][w[4] as usize]
+            ^ CRC_TABLES[2][w[5] as usize]
+            ^ CRC_TABLES[1][w[6] as usize]
+            ^ CRC_TABLES[0][w[7] as usize];
+    }
+    for &b in chunks.remainder() {
+        crc = crc_update(crc, b);
+    }
+    crc
 }
 
 /// MSB-first bit cursor over a caller-owned slice. Holds no io type and no buffer:
@@ -397,6 +483,8 @@ pub struct BlockDecoder {
     combined_crc: u32,
     /// BWT scratch, reused across blocks: byte in the low 8 bits, source index above.
     tt: Vec<u32>,
+    /// Post-MTF/RLE2 block bytes (the BWT last column), reused across blocks.
+    bytes: Vec<u8>,
 }
 
 impl Default for BlockDecoder {
@@ -414,6 +502,7 @@ impl BlockDecoder {
             block_size: 0,
             combined_crc: 0,
             tt: Vec::new(),
+            bytes: Vec::new(),
         }
     }
 
@@ -500,6 +589,8 @@ impl BlockDecoder {
     }
 
     fn decode_block(&mut self, bits: &mut BitCursor<'_>, out: &mut Vec<u8>) -> Result<(), Error> {
+        #[cfg(feature = "phasetime")]
+        let mut _pt = phasetime::Scope::new();
         let block_crc = bits.read_bits(32)?;
         if bits.read_bit()? != 0 {
             return Err(Error::RandomizedBlock);
@@ -577,10 +668,13 @@ impl BlockDecoder {
             tables.push(HuffTable::build(&len)?);
         }
 
-        // MTF + RLE2 decode into the BWT input buffer `tt` (byte in low 8 bits).
-        self.tt.clear();
+        #[cfg(feature = "phasetime")]
+        _pt.lap(0); // header + selectors + tables
+        // MTF + RLE2 decode into the BWT byte buffer (the last column, one byte per
+        // cell — denser than decoding straight into `tt`, and run fills are memsets).
+        self.bytes.clear();
         // Avoid reallocations for the common case by reserving the declared block size.
-        self.tt.reserve(self.block_size);
+        self.bytes.reserve(self.block_size);
         let mut cftab = [0u32; 257];
         let mut mtf = seq_to_unseq.clone();
         let mut sel_idx = 0usize;
@@ -619,14 +713,12 @@ impl BlockDecoder {
 
             if run > 0 {
                 let b = mtf[0];
-                if self.tt.len() + run as usize > self.block_size {
+                if self.bytes.len() + run as usize > self.block_size {
                     return Err(Error::BlockOverflow);
                 }
-                let entry = b as u32;
                 cftab[b as usize + 1] += run as u32;
-                for _ in 0..run {
-                    self.tt.push(entry);
-                }
+                // Splat the run in one resize (a memset) instead of `run` pushes.
+                self.bytes.resize(self.bytes.len() + run as usize, b);
                 run = 0;
                 run_bit = 0;
             }
@@ -644,14 +736,16 @@ impl BlockDecoder {
             mtf.copy_within(0..nn, 1);
             mtf[0] = b;
 
-            if self.tt.len() + 1 > self.block_size {
+            if self.bytes.len() + 1 > self.block_size {
                 return Err(Error::BlockOverflow);
             }
-            self.tt.push(b as u32);
+            self.bytes.push(b);
             cftab[b as usize + 1] += 1;
         }
 
-        let nblock = self.tt.len();
+        #[cfg(feature = "phasetime")]
+        _pt.lap(1); // huffman + MTF + RLE2
+        let nblock = self.bytes.len();
         if nblock == 0 || orig_ptr >= nblock {
             return Err(Error::InvalidBlock);
         }
@@ -661,48 +755,76 @@ impl BlockDecoder {
             cftab[i] += cftab[i - 1];
         }
 
-        // Inverse Burrows–Wheeler transform (fast form): thread the source index
-        // into the high bits of each `tt` cell, then walk from `orig_ptr`.
-        // Thread the source index into the high bits of each `tt` cell.
-        // Use unchecked indexing in this hot loop to eliminate bounds checks
-        // — correctness is guaranteed by the cftab computation above.
+        // Inverse Burrows–Wheeler transform (fast form): build the successor vector,
+        // then walk from `orig_ptr`. Cell `j` is written exactly once with
+        // `(i << 8) | L[i]` — the source index *paired with its own byte* — rather
+        // than libbz2's `tt[cftab[b]] |= i << 8` read-modify-write. The walk output
+        // is identical (each step reads one cell and gets both the next position and
+        // that position's byte), but this pass only *writes* the scattered lines and
+        // reads the dense byte buffer sequentially.
+        self.tt.clear();
+        self.tt.reserve(nblock);
+        // Safety: every cell in `0..nblock` is written exactly once below — `cftab`
+        // partitions `0..nblock` into per-byte ranges and each write consumes one slot.
         unsafe {
-            let tt_ptr = self.tt.as_mut_ptr();
+            self.tt.set_len(nblock);
+            let bp = self.bytes.as_ptr();
+            let tp = self.tt.as_mut_ptr();
             for i in 0..nblock {
-                let b = (*tt_ptr.add(i) & 0xff) as usize;
-                let idx = cftab[b] as usize;
-                let val = *tt_ptr.add(idx) | ((i as u32) << 8);
-                *tt_ptr.add(idx) = val;
-                cftab[b] += 1;
+                let b = *bp.add(i) as usize;
+                let idx = *cftab.get_unchecked(b) as usize;
+                *cftab.get_unchecked_mut(b) = (idx + 1) as u32;
+                *tp.add(idx) = ((i as u32) << 8) | b as u32;
             }
         }
 
+        #[cfg(feature = "phasetime")]
+        _pt.lap(2); // cftab + index threading
         // Walk the permutation, applying RLE1 and CRC to produce the plaintext block.
+        // The CRC stays fused into this loop: the walk is latency-bound on the
+        // dependent `tt` load chain, so the per-byte CRC executes for free under it.
         // No bits are read past this point, so `out` only grows once the block is
         // structurally sound.
         let mut crc = 0xFFFF_FFFFu32;
-        let mut t_pos = self.tt[orig_ptr] >> 8;
+        // Each cell holds `(next_pos << 8) | byte_of_next_pos`, so one load per step
+        // yields both the byte to emit and where to go.
+        let mut t_pos = self.tt[orig_ptr];
         let mut prev: i32 = -1;
         let mut count: u32 = 0;
-        // Walk the permutation, applying RLE1 and CRC to produce the plaintext block.
-        // Use unchecked reads from `tt` to avoid per-iteration bounds checks.
+        // Write through a raw cursor into reserved capacity: one capacity check per
+        // iteration (against the 255-byte worst case) instead of a `push` per byte,
+        // and RLE1 runs become a single `write_bytes` (memset).
         unsafe {
             let tt_ptr = self.tt.as_ptr();
+            let mut len = out.len();
+            let mut dst = out.as_mut_ptr().add(len);
+            let mut room = out.capacity() - len;
             for _ in 0..nblock {
-                t_pos = *tt_ptr.add(t_pos as usize);
+                if room < 256 {
+                    out.set_len(len);
+                    out.reserve(nblock.max(4096));
+                    dst = out.as_mut_ptr().add(len);
+                    room = out.capacity() - len;
+                }
                 let b = (t_pos & 0xff) as u8;
-                t_pos >>= 8;
+                t_pos = *tt_ptr.add((t_pos >> 8) as usize);
 
                 if count == 4 {
                     // `b` is the count of extra repeats beyond the four literals.
+                    ptr::write_bytes(dst, prev as u8, b as usize);
                     for _ in 0..b {
-                        out.push(prev as u8);
                         crc = crc_update(crc, prev as u8);
                     }
+                    dst = dst.add(b as usize);
+                    len += b as usize;
+                    room -= b as usize;
                     count = 0;
                     prev = -1;
                 } else {
-                    out.push(b);
+                    *dst = b;
+                    dst = dst.add(1);
+                    len += 1;
+                    room -= 1;
                     crc = crc_update(crc, b);
                     if b as i32 == prev {
                         count += 1;
@@ -712,8 +834,11 @@ impl BlockDecoder {
                     }
                 }
             }
+            out.set_len(len);
         }
 
+        #[cfg(feature = "phasetime")]
+        _pt.lap(3); // permutation walk + RLE1 + CRC
         let crc = !crc;
         if crc != block_crc {
             return Err(Error::CrcMismatch);
