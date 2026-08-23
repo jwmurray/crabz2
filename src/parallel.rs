@@ -416,15 +416,35 @@ fn assemble(input: &[u8], mut blocks: BTreeMap<usize, Decoded>) -> Result<(Vec<u
 }
 
 /// The plaintext, plus how many blocks came from the thread pool rather than from a
-/// serial fallback.
+/// serial fallback. Only tests call this directly — production goes through
+/// [`decode_auto`] — but it stays a real function so the suite can prove the fast
+/// path on arbitrarily small streams.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn decode(input: &[u8]) -> Result<(Vec<u8>, usize), Error> {
+    decode_impl(input, 0)
+}
+
+/// [`decode`], but handing streams of fewer than `min_candidates` likely blocks to
+/// the serial decoder. With one or two blocks the pipelined serial path already
+/// overlaps everything the pool could overlap — the walks interleave on one core
+/// and are latency- rather than throughput-bound — without paying scheduling and
+/// thread wake-up on the critical path. The public entry uses this; tests call
+/// [`decode`] directly so the fast path stays proven on small streams too.
+pub(crate) fn decode_auto(input: &[u8]) -> Result<(Vec<u8>, usize), Error> {
+    decode_impl(input, 3)
+}
+
+fn decode_impl(input: &[u8], min_candidates: usize) -> Result<(Vec<u8>, usize), Error> {
     let candidates = scan_candidates(input);
 
     // A real block header is well over a hundred bits, so a legitimate stream has
     // orders of magnitude fewer candidates than this. An input deliberately stuffed
     // with the magic would otherwise buy unbounded speculative work; serial decode of
     // it is both correct and cheaper.
-    if candidates.is_empty() || candidates.len() > input.len() / 16 + 64 {
+    if candidates.is_empty()
+        || candidates.len() < min_candidates
+        || candidates.len() > input.len() / 16 + 64
+    {
         return Ok((crate::decompress_to_vec(input)?, 0));
     }
 
@@ -498,10 +518,10 @@ pub(crate) fn decode(input: &[u8]) -> Result<(Vec<u8>, usize), Error> {
 pub fn decompress_parallel(compressed: &[u8], threads: Option<usize>) -> io::Result<Vec<u8>> {
     match threads {
         Some(1) => crate::decompress(compressed),
-        None | Some(0) => Ok(decode(compressed)?.0),
+        None | Some(0) => Ok(decode_auto(compressed)?.0),
         Some(n) => {
             let pool = pool_for(n).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            Ok(pool.install(|| decode(compressed))?.0)
+            Ok(pool.install(|| decode_auto(compressed))?.0)
         }
     }
 }
