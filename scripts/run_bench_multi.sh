@@ -10,10 +10,23 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_DIR"
 
 OUT=bench_multi.csv
-echo "input_mb,crabz2_mb_s,libbz2_mb_s,bzip2_mb_s,threads" > "$OUT"
+echo "input_mb,crabz2_mb_s,libbz2_mb_s,bzip2_mb_s,parallel_bzip2_mb_s,parallel_cmd,threads" > "$OUT"
 
 THREADS=8
 ITERS=3
+
+# detect parallel bzip2 implementations for a multi-threaded C baseline
+PBZIP=$(command -v pbzip2 || true)
+LBZIP=$(command -v lbzip2 || true)
+PAR_CMD=""
+PAR_TYPE=""
+if [ -n "$PBZIP" ]; then
+  PAR_CMD="$PBZIP"
+  PAR_TYPE="pbzip2"
+elif [ -n "$LBZIP" ]; then
+  PAR_CMD="$LBZIP"
+  PAR_TYPE="lbzip2"
+fi
 
 for sz in 1 5 10 50 100; do
   echo "Running ${sz} MB test..."
@@ -73,12 +86,46 @@ PY
   plain_size=$(stat -f%z "$PLAIN")
   bzip2_mbs=$(awk -v b="$plain_size" -v s="$bzip2_real" 'BEGIN{printf "%.1f", (b/1e6)/s}')
 
-  echo "${sz},${crab_mbs},${lib_mbs},${bzip2_mbs},${THREADS}" >> "$OUT"
+  # Measure parallel pbzip2/lbzip2 if available
+  par_mbs=""
+  if [ -n "$PAR_CMD" ]; then
+    echo "  running $PAR_CMD - threads=$THREADS..."
+    if [ "$PAR_TYPE" = "pbzip2" ]; then
+      python3 - <<PY > /tmp/parallel_time.txt 2>/dev/null
+import time, subprocess
+cmd = ["$PAR_CMD", "-dc", "-p", str($THREADS), "$BZ"]
+start = time.time()
+subprocess.check_call(cmd, stdout=subprocess.DEVNULL)
+end = time.time()
+print(end-start)
+PY
+    else
+      python3 - <<PY > /tmp/parallel_time.txt 2>/dev/null
+import time, subprocess
+cmd = ["$PAR_CMD", "-dc", "-n", str($THREADS), "$BZ"]
+start = time.time()
+subprocess.check_call(cmd, stdout=subprocess.DEVNULL)
+end = time.time()
+print(end-start)
+PY
+    fi
+    par_real=$(cat /tmp/parallel_time.txt)
+    if [ -z "$par_real" ] || awk "BEGIN{print ($par_real<=0)}" | grep -q 1; then
+      par_real=0.000001
+    fi
+    par_mbs=$(awk -v b="$plain_size" -v s="$par_real" 'BEGIN{printf "%.1f", (b/1e6)/s}')
+  fi
+
+  echo "${sz},${crab_mbs},${lib_mbs},${bzip2_mbs},${par_mbs},${PAR_CMD},${THREADS}" >> "$OUT"
 
   # Print comparative summary for this size.
-  echo "  Results (${sz} MB): crabz2=${crab_mbs} MB/s, libbz2=${lib_mbs} MB/s, bzip2=${bzip2_mbs} MB/s"
-  # Compute speedups (crabz2 relative to others)
-  awk -v c=${crab_mbs} -v l=${lib_mbs} -v b=${bzip2_mbs} 'BEGIN{printf "  Speedups: crabz2/libbz2 = %.2fx, crabz2/bzip2 = %.2fx\n", (c/l), (c/b)}'
+  if [ -n "$par_mbs" ]; then
+    echo "  Results (${sz} MB): crabz2=${crab_mbs} MB/s, libbz2=${lib_mbs} MB/s, bzip2=${bzip2_mbs} MB/s, parallel=${par_mbs} MB/s ($PAR_CMD)"
+    awk -v c=${crab_mbs} -v p=${par_mbs} 'BEGIN{printf "  Speedups: crabz2/parallel = %.2fx\n", (c/p)}'
+  else
+    echo "  Results (${sz} MB): crabz2=${crab_mbs} MB/s, libbz2=${lib_mbs} MB/s, bzip2=${bzip2_mbs} MB/s"
+    awk -v c=${crab_mbs} -v l=${lib_mbs} -v b=${bzip2_mbs} 'BEGIN{printf "  Speedups: crabz2/libbz2 = %.2fx, crabz2/bzip2 = %.2fx\n", (c/l), (c/b)}'
+  fi
 
   rm -f "$COMP_OUT"
 done
