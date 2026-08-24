@@ -469,6 +469,75 @@ std::thread_local! {
         core::cell::RefCell::new((BlockDecoder::new(), BlockDecoder::new(), Vec::new()));
 }
 
+/// Physical (not logical) core count, cached after the first probe.
+///
+/// The pairing decision in [`decode_impl`] turns on whether the pool is running
+/// one worker per core or oversubscribing SMT siblings, and `rayon` only reports
+/// logical CPUs. Falls back to the logical count where the topology cannot be
+/// read, which selects the unpaired path — the right default for the machines we
+/// can measure.
+fn physical_cores() -> usize {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static CACHE: AtomicUsize = AtomicUsize::new(0);
+
+    let cached = CACHE.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let n = detect_physical_cores()
+        .unwrap_or_else(rayon::current_num_threads)
+        .max(1);
+    // A benign race: two threads may probe concurrently and agree on the answer.
+    CACHE.store(n, Ordering::Relaxed);
+    n
+}
+
+/// Count distinct SMT sibling groups; each group is one physical core.
+#[cfg(target_os = "linux")]
+fn detect_physical_cores() -> Option<usize> {
+    use std::collections::BTreeSet;
+
+    let mut cores = BTreeSet::new();
+    for entry in std::fs::read_dir("/sys/devices/system/cpu").ok()? {
+        let path = match entry {
+            Ok(e) => e.path(),
+            Err(_) => continue,
+        };
+        let is_cpu_n = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| {
+                n.len() > 3 && n.starts_with("cpu") && n[3..].bytes().all(|b| b.is_ascii_digit())
+            })
+            .unwrap_or(false);
+        if !is_cpu_n {
+            continue;
+        }
+        if let Ok(sibs) = std::fs::read_to_string(path.join("topology/thread_siblings_list")) {
+            cores.insert(sibs.trim().to_owned());
+        }
+    }
+    if cores.is_empty() {
+        None
+    } else {
+        Some(cores.len())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn detect_physical_cores() -> Option<usize> {
+    let out = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "hw.physicalcpu"])
+        .output()
+        .ok()?;
+    core::str::from_utf8(&out.stdout).ok()?.trim().parse().ok()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn detect_physical_cores() -> Option<usize> {
+    None
+}
+
 fn decode_impl(input: &[u8], min_candidates: usize) -> Result<(Vec<u8>, usize), Error> {
     let candidates = scan_candidates(input);
 
@@ -489,9 +558,24 @@ fn decode_impl(input: &[u8], min_candidates: usize) -> Result<(Vec<u8>, usize), 
     // Interleaved pair decode halves the task count, so only pair when there are
     // still several tasks per worker — otherwise (few blocks) pairing costs more
     // occupancy than the overlapped walks win back.
-    let chunk = if candidates.len() >= 4 * rayon::current_num_threads() {
+    let threads = rayon::current_num_threads();
+    let chunk = if candidates.len() < 4 * threads {
+        // Too few tasks to pair without starving workers of occupancy.
+        1
+    } else if threads <= 2 || threads > physical_cores() {
+        // Pair. Two cases want the extra chains: too few cores for thread-level
+        // parallelism to fill the memory system on its own, and SMT
+        // oversubscription, where siblings share a core's miss slots and more
+        // chains per core still pay.
         2
     } else {
+        // One block per worker. Pairing doubles a worker's resident footprint
+        // (two ~3.6 MB `tt` arrays at level 9 instead of one) to buy chain
+        // overlap that thread-level parallelism is already supplying, so past a
+        // handful of cores it is pure cache pressure. Measured on a 100 MB
+        // realistic corpus, paired vs unpaired: M5 Max 291 -> 376 MB/s at 8
+        // threads and 369 -> 471 at 16; Ryzen 9 7940HS 120 -> 223 at 4 threads
+        // and 166 -> 226 at 8.
         1
     };
     let decoded: Vec<(Option<Decoded>, Option<Decoded>)> = candidates
