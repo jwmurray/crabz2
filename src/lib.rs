@@ -255,6 +255,10 @@ const CRC_TABLES: [[u32; 256]; 8] = {
     tables
 };
 
+/// Walk steps between CRC folds on the checked path. Small enough that the bytes
+/// just written are still in cache when they are folded.
+const CRC_FOLD_STEPS: usize = 4096;
+
 /// CRC-32/BZIP2 over a whole slice, eight bytes per round.
 ///
 /// The walk used to fold each byte in as it was emitted, which put a second serial
@@ -1077,9 +1081,12 @@ struct WalkCursor<'a> {
     t_pos: u32,
     prev: i32,
     count: u32,
-    /// Where this block's bytes begin in `out`. The CRC is taken over
-    /// `out[start..]` once the walk is finished, not folded in per byte.
-    start: usize,
+    /// Running block CRC, folded a chunk at a time rather than a byte at a time.
+    crc: u32,
+    /// How far into `out` the CRC has consumed. Bytes past this are written but
+    /// not yet folded; [`fold_crc`](WalkCursor::fold_crc) catches it up while they
+    /// are still cache-warm, which a single pass at the end would not be.
+    crc_done: usize,
     /// Steps left; one step per `tt` cell.
     rem: usize,
     out: &'a mut Vec<u8>,
@@ -1100,7 +1107,8 @@ impl<'a> WalkCursor<'a> {
             t_pos: tt[orig_ptr],
             prev: -1,
             count: 0,
-            start: len,
+            crc: 0xFFFF_FFFF,
+            crc_done: len,
             rem: tt.len(),
             dst: out.as_mut_ptr().wrapping_add(len),
             room: out.capacity() - len,
@@ -1120,6 +1128,25 @@ impl<'a> WalkCursor<'a> {
             self.room = self.out.capacity() - self.len;
         }
         (self.room >> 8).min(self.rem)
+    }
+
+    /// Fold everything written since the last call into the running CRC.
+    ///
+    /// Called once per chunk, so the bytes are still in L1/L2 from having just been
+    /// written. Deferring to one pass over the finished block instead measured
+    /// slower on aarch64: the walk is not instruction-bound there, so re-reading a
+    /// cold 900 KB block cost more than the per-byte fold it replaced.
+    fn fold_crc(&mut self) {
+        // Safety: `out[crc_done..len]` was written by `step_unchecked` above; the
+        // `Vec`'s own length is only committed in `finish`.
+        let fresh = unsafe {
+            core::slice::from_raw_parts(
+                self.out.as_ptr().add(self.crc_done),
+                self.len - self.crc_done,
+            )
+        };
+        self.crc = crc_bytes(self.crc, fresh);
+        self.crc_done = self.len;
     }
 
     /// # Safety
@@ -1165,12 +1192,13 @@ impl<'a> WalkCursor<'a> {
                     self.step_unchecked();
                 }
                 self.rem -= chunk;
+                self.fold_crc();
             }
             self.out.set_len(self.len);
         }
         #[cfg(feature = "phasetime")]
-        _pt.lap(3); // permutation walk + RLE1
-        !crc_bytes(0xFFFF_FFFF, &self.out[self.start..self.len])
+        _pt.lap(3); // permutation walk + RLE1 + CRC
+        !self.crc
     }
 }
 
@@ -1187,6 +1215,8 @@ fn walk_pair(mut a: WalkCursor<'_>, mut b: WalkCursor<'_>) -> (u32, u32) {
             }
             a.rem -= chunk;
             b.rem -= chunk;
+            a.fold_crc();
+            b.fold_crc();
         }
     }
     (a.finish(), b.finish())
@@ -1202,9 +1232,12 @@ struct WalkCursor<'a> {
     t_pos: u32,
     prev: i32,
     count: u32,
-    /// Where this block's bytes begin in `out`. The CRC is taken over
-    /// `out[start..]` once the walk is finished, not folded in per byte.
-    start: usize,
+    /// Running block CRC, folded a chunk at a time rather than a byte at a time.
+    crc: u32,
+    /// How far into `out` the CRC has consumed. Bytes past this are written but
+    /// not yet folded; [`fold_crc`](WalkCursor::fold_crc) catches it up while they
+    /// are still cache-warm, which a single pass at the end would not be.
+    crc_done: usize,
     /// Steps left; one step per `tt` cell.
     rem: usize,
     out: &'a mut Vec<u8>,
@@ -1213,16 +1246,25 @@ struct WalkCursor<'a> {
 #[cfg(not(feature = "unsafe-fast"))]
 impl<'a> WalkCursor<'a> {
     fn begin(tt: &'a [u32], orig_ptr: usize, out: &'a mut Vec<u8>) -> WalkCursor<'a> {
-        let start = out.len();
+        let crc_done = out.len();
         WalkCursor {
             t_pos: tt[orig_ptr],
             tt,
             prev: -1,
             count: 0,
-            start,
+            crc: 0xFFFF_FFFF,
+            crc_done,
             rem: tt.len(),
             out,
         }
+    }
+
+    /// Fold everything pushed since the last call into the running CRC, while
+    /// those bytes are still cache-warm from being written.
+    fn fold_crc(&mut self) {
+        let end = self.out.len();
+        self.crc = crc_bytes(self.crc, &self.out[self.crc_done..end]);
+        self.crc_done = end;
     }
 
     #[inline(always)]
@@ -1253,12 +1295,16 @@ impl<'a> WalkCursor<'a> {
         let mut _pt = phasetime::Scope::new();
         self.out.reserve(self.rem);
         while self.rem > 0 {
-            self.step();
-            self.rem -= 1;
+            let chunk = self.rem.min(CRC_FOLD_STEPS);
+            for _ in 0..chunk {
+                self.step();
+            }
+            self.rem -= chunk;
+            self.fold_crc();
         }
         #[cfg(feature = "phasetime")]
-        _pt.lap(3); // permutation walk + RLE1
-        !crc_bytes(0xFFFF_FFFF, &self.out[self.start..])
+        _pt.lap(3); // permutation walk + RLE1 + CRC
+        !self.crc
     }
 }
 
@@ -1268,10 +1314,15 @@ fn walk_pair(mut a: WalkCursor<'_>, mut b: WalkCursor<'_>) -> (u32, u32) {
     a.out.reserve(a.rem);
     b.out.reserve(b.rem);
     while a.rem > 0 && b.rem > 0 {
-        a.step();
-        b.step();
-        a.rem -= 1;
-        b.rem -= 1;
+        let chunk = a.rem.min(b.rem).min(CRC_FOLD_STEPS);
+        for _ in 0..chunk {
+            a.step();
+            b.step();
+        }
+        a.rem -= chunk;
+        b.rem -= chunk;
+        a.fold_crc();
+        b.fold_crc();
     }
     (a.finish(), b.finish())
 }
@@ -1640,7 +1691,11 @@ mod tests {
         for len in (0..40usize).chain([64, 127, 128, 129, 512, 999, 1000]) {
             let slice = &data[..len];
             let want = slice.iter().fold(0xFFFF_FFFFu32, |c, &b| crc_update(c, b));
-            assert_eq!(want, crc_bytes(0xFFFF_FFFF, slice), "crc mismatch at len {len}");
+            assert_eq!(
+                want,
+                crc_bytes(0xFFFF_FFFF, slice),
+                "crc mismatch at len {len}"
+            );
         }
         // A long run: the RLE1 shape the walk used to fold one byte at a time.
         let run = [0xABu8; 5000];
