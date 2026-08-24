@@ -701,8 +701,7 @@ mod tests {
 
         for round in 0..3 {
             // width 1: four walks, one after another
-            let (mut o0, mut o1, mut o2, mut o3) =
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let (mut o0, mut o1, mut o2, mut o3) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             let t = std::time::Instant::now();
             let r1 = (
                 crate::WalkCursor::begin(&d0.tt, p0, &mut o0).finish(),
@@ -713,8 +712,7 @@ mod tests {
             let w1 = t.elapsed();
 
             // width 2: two paired walks
-            let (mut q0, mut q1, mut q2, mut q3) =
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let (mut q0, mut q1, mut q2, mut q3) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             let t = std::time::Instant::now();
             let (a0, a1) = walk_pair(
                 crate::WalkCursor::begin(&d0.tt, p0, &mut q0),
@@ -742,9 +740,7 @@ mod tests {
             assert_eq!(r1, r4, "width 4 CRC mismatch");
             assert_eq!((&o0, &o1), (&q0, &q1));
             assert_eq!((&o0, &o1, &o2, &o3), (&r0v, &r1v, &r2v, &r3v));
-            eprintln!(
-                "round {round}: width1 {w1:?}  width2 {w2:?}  width4 {w4:?}"
-            );
+            eprintln!("round {round}: width1 {w1:?}  width2 {w2:?}  width4 {w4:?}");
         }
     }
 
