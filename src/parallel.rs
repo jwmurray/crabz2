@@ -750,4 +750,112 @@ mod tests {
             eprintln!("round {round}: sequential {sequential:?} vs paired {paired:?}");
         }
     }
+
+    /// Dev experiment, not a correctness test: how far does widening the interleave
+    /// pay? Each walk step is a serial dependent load, so width is memory-level
+    /// parallelism. Width 2 is what `walk_pair` ships.
+    /// `cargo test --release --features parallel walk_width_scaling -- --ignored --nocapture`
+    ///
+    /// Safe-build only: the comparison is between widths, so the default checked
+    /// cursor is a fine vehicle, and `unsafe-fast` swaps in a cursor stepped by
+    /// `unsafe fn step_unchecked` — duplicating the harness for it would not say
+    /// anything more about width.
+    #[cfg(not(feature = "unsafe-fast"))]
+    #[test]
+    #[ignore]
+    fn walk_width_scaling() {
+        let mut plain = Vec::new();
+        let words: &[&[u8]] = &[
+            b"alpha", b"bravo", b"charlie", b"delta", b"echo", b"foxtrot", b"golf", b"hotel",
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        while plain.len() < 8_000_000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            plain.extend_from_slice(words[(state >> 33) as usize % words.len()]);
+            plain.push(b' ');
+        }
+        let packed = crate::compress(&plain, crate::Level::BEST);
+        let starts = scan_candidates(&packed);
+        assert!(starts.len() >= 8, "need eight blocks, got {}", starts.len());
+
+        let mut d0 = BlockDecoder::new();
+        let mut d1 = BlockDecoder::new();
+        let mut d2 = BlockDecoder::new();
+        let mut d3 = BlockDecoder::new();
+        let p0 = prepare_speculative(&mut d0, &packed, starts[0]).unwrap().1;
+        let p1 = prepare_speculative(&mut d1, &packed, starts[1]).unwrap().1;
+        let p2 = prepare_speculative(&mut d2, &packed, starts[2]).unwrap().1;
+        let p3 = prepare_speculative(&mut d3, &packed, starts[3]).unwrap().1;
+
+        for round in 0..3 {
+            // width 1: four walks, one after another
+            let (mut o0, mut o1, mut o2, mut o3) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let t = std::time::Instant::now();
+            let r1 = (
+                crate::WalkCursor::begin(&d0.tt, p0, &mut o0).finish(),
+                crate::WalkCursor::begin(&d1.tt, p1, &mut o1).finish(),
+                crate::WalkCursor::begin(&d2.tt, p2, &mut o2).finish(),
+                crate::WalkCursor::begin(&d3.tt, p3, &mut o3).finish(),
+            );
+            let w1 = t.elapsed();
+
+            // width 2: two paired walks
+            let (mut q0, mut q1, mut q2, mut q3) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let t = std::time::Instant::now();
+            let (a0, a1) = walk_pair(
+                crate::WalkCursor::begin(&d0.tt, p0, &mut q0),
+                crate::WalkCursor::begin(&d1.tt, p1, &mut q1),
+            );
+            let (a2, a3) = walk_pair(
+                crate::WalkCursor::begin(&d2.tt, p2, &mut q2),
+                crate::WalkCursor::begin(&d3.tt, p3, &mut q3),
+            );
+            let w2 = t.elapsed();
+
+            // width 4: all four interleaved
+            let (mut r0v, mut r1v, mut r2v, mut r3v) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let t = std::time::Instant::now();
+            let r4 = walk_quad_experiment(
+                crate::WalkCursor::begin(&d0.tt, p0, &mut r0v),
+                crate::WalkCursor::begin(&d1.tt, p1, &mut r1v),
+                crate::WalkCursor::begin(&d2.tt, p2, &mut r2v),
+                crate::WalkCursor::begin(&d3.tt, p3, &mut r3v),
+            );
+            let w4 = t.elapsed();
+
+            assert_eq!(r1, (a0, a1, a2, a3), "width 2 CRC mismatch");
+            assert_eq!(r1, r4, "width 4 CRC mismatch");
+            assert_eq!((&o0, &o1), (&q0, &q1));
+            assert_eq!((&o0, &o1, &o2, &o3), (&r0v, &r1v, &r2v, &r3v));
+            eprintln!("round {round}: width1 {w1:?}  width2 {w2:?}  width4 {w4:?}");
+        }
+    }
+
+    /// Experimental 4-wide interleave, mirroring `walk_pair`'s shape.
+    #[cfg(not(feature = "unsafe-fast"))]
+    fn walk_quad_experiment(
+        mut a: crate::WalkCursor<'_>,
+        mut b: crate::WalkCursor<'_>,
+        mut c: crate::WalkCursor<'_>,
+        mut d: crate::WalkCursor<'_>,
+    ) -> (u32, u32, u32, u32) {
+        a.out.reserve(a.rem);
+        b.out.reserve(b.rem);
+        c.out.reserve(c.rem);
+        d.out.reserve(d.rem);
+        while a.rem > 0 && b.rem > 0 && c.rem > 0 && d.rem > 0 {
+            a.step();
+            b.step();
+            c.step();
+            d.step();
+            a.rem -= 1;
+            b.rem -= 1;
+            c.rem -= 1;
+            d.rem -= 1;
+        }
+        (a.finish(), b.finish(), c.finish(), d.finish())
+    }
 }
