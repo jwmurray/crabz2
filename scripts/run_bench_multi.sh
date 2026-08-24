@@ -10,7 +10,7 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_DIR"
 
 OUT=bench_multi.csv
-echo "input_mb,crabz2_mb_s,libbz2_mb_s,bzip2_mb_s,parallel_bzip2_mb_s,parallel_cmd,threads,plain_bytes,num_blocks" > "$OUT"
+echo "input_mb,crabz2_serial_mb_s,crabz2_mb_s,libbz2_mb_s,bzip2_mb_s,parallel_bzip2_mb_s,parallel_cmd,threads,plain_bytes,num_blocks" > "$OUT"
 
 THREADS=8
 ITERS=5
@@ -64,6 +64,14 @@ PY
   # Extract MB/s from the compare example output.
   crab_mbs=$(sed -nE 's/.*crabz2 average: .*-> ([0-9.]+) MB\/s/\1/p' "$COMP_OUT" | head -n1)
   lib_mbs=$(sed -nE 's/.*libbz2 average: .*-> ([0-9.]+) MB\/s/\1/p' "$COMP_OUT" | head -n1)
+
+  # Serial crabz2 (threads=1) through the same harness, for the single-thread
+  # vs single-thread comparison against libbz2 above.
+  echo "  running cargo compare example (crabz2 serial, threads=1) ..."
+  SER_OUT=$(mktemp)
+  cargo run --release --example compare --features "libbz2 parallel" -- "$BZ" $ITERS 1 > "$SER_OUT" 2>&1 || (cat "$SER_OUT" && exit 1)
+  crab_ser_mbs=$(sed -nE 's/.*crabz2 average: .*-> ([0-9.]+) MB\/s/\1/p' "$SER_OUT" | head -n1)
+  rm -f "$SER_OUT"
   if [ -z "$crab_mbs" ] || [ -z "$lib_mbs" ]; then
     echo "Failed to parse compare example output:" >&2
     sed -n '1,200p' "$COMP_OUT" >&2
@@ -143,7 +151,7 @@ PY
   block_bytes=$((block100k * 100000))
   num_blocks=$(( (plain_size + block_bytes - 1) / block_bytes ))
 
-  echo "${sz},${crab_mbs},${lib_mbs},${bzip2_mbs},${par_mbs},${PAR_CMD},${THREADS},${plain_size},${num_blocks}" >> "$OUT"
+  echo "${sz},${crab_ser_mbs},${crab_mbs},${lib_mbs},${bzip2_mbs},${par_mbs},${PAR_CMD},${THREADS},${plain_size},${num_blocks}" >> "$OUT"
 
   # Print comparative summary for this size.
   if [ -n "$par_mbs" ]; then

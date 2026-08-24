@@ -5,12 +5,20 @@
 Pure-Rust **bzip2 compression and decompression** — no C, no bundled `libbz2`, no
 third-party bzip2 crate. 🦀
 
-**Faster than the C implementations in our decode benchmarks.** On the
-multi-size benchmark below, `crabz2` beats C `libbz2` (via the `bzip2` crate), the
-system `bzip2` binary, and parallel `lbzip2` at every input size from 1 MB to
-100 MB — up to **6.6x** libbz2's throughput at 100 MB:
+**Faster than C `libbz2` in our decode benchmarks — like for like, on both axes.**
+Single-threaded on 10 MiB corpora, `crabz2` decodes **9–17% faster** than C `libbz2`
+(via the `bzip2` crate) across prose, CSV, and incompressible input. With the
+`parallel` feature on 8 threads, it decodes **1.15x faster** than parallel C `lbzip2`
+at 50–100 MB. Both comparisons, and what they do and do not show, are below.
 
 ![Decode throughput: crabz2 vs libbz2, bzip2, and lbzip2](https://raw.githubusercontent.com/jwmurray/crabz2/main/docs/bench_multi.svg)
+
+*The chart plots `crabz2` with `parallel` (8 threads) alongside single-threaded
+`libbz2` and `bzip2` and parallel `lbzip2`, from an earlier run of
+`scripts/run_bench_multi.sh`. The single-threaded C columns are there for scale, not
+as a like-for-like comparison — only `crabz2` serial vs `libbz2`, and `crabz2`
+parallel vs `lbzip2`, compare equal thread counts. Current numbers are in the tables
+below.*
 
 `crabz2` implements both bzip2 pipelines itself, with **zero dependencies**:
 
@@ -27,7 +35,8 @@ the piece the ecosystem was missing.
 
 | Version | What it ships |
 |---|---|
-| **0.6.0** (now) | **Zero `unsafe` by default**, enforced by `#![forbid(unsafe_code)]`; the raw-pointer hot paths moved behind the non-default `unsafe-fast` feature after benchmarks showed the difference is within noise. |
+| **0.6.1** (now) | Benchmark documentation corrected: like-for-like comparisons only (crabz2 serial vs `libbz2`, crabz2 `parallel(8)` vs `lbzip2 -n 8`), the parallel-vs-serial "6.6x" headline removed, decode numbers re-measured, and `run_bench_multi.sh` extended with a serial crabz2 column. No code changes. |
+| 0.6.0 | **Zero `unsafe` by default**, enforced by `#![forbid(unsafe_code)]`; the raw-pointer hot paths moved behind the non-default `unsafe-fast` feature after benchmarks showed the difference is within noise. |
 | 0.5.0 | Decode hot path rewritten from profiling: write-only IBWT threading, interleaved pair walks (software-pipelined serially, paired speculation in parallel), fast-table Huffman over a 64-bit bit reservoir, arena MTF, cached thread pools, parallel output assembly. Decode now **beats C libbz2 single-threaded and lbzip2 in parallel at every benchmarked size**. |
 | 0.4.0 | The full format in pure Rust. Pure-Rust **encoder** — `compress`, `Crabz2Writer`, levels 1–9, verified against system `bzip2`. Decoder behind a sans-io state machine: `no_std + alloc` core, `wasm32-unknown-unknown` and a bare-metal target checked in CI. Non-default `parallel` feature for multi-core decode. The [`crabz2-wasm`](crabz2-wasm/) npm package (`npm install crabz2`) with a streaming JS API and a [live browser demo](https://jwmurray.github.io/crabz2/). Criterion benchmarks vs libbz2 below. |
 | 0.3.1 | The 0.2 decoder, hardened against crafted RLE2 run lengths, with a `cargo-fuzz` target. |
@@ -91,7 +100,7 @@ file can be decoded across cores. That is what `lbzip2` does out of process; the
 
 ```toml
 [dependencies]
-crabz2 = { version = "0.3", features = ["parallel"] }
+crabz2 = { version = "0.6", features = ["parallel"] }
 ```
 
 ```rust
@@ -146,17 +155,34 @@ cargo run --release --features parallel --example parallel -- file.bz2 8 > /dev/
 
 The `scripts/run_bench_multi.sh` script writes a CSV named [bench_multi.csv](bench_multi.csv)
 and is the source of the chart above ([docs/bench_multi.svg](docs/bench_multi.svg)).
-The most recent run produced these numbers (MB/s of plaintext out) — **crabz2 is the
-fastest column at every size**, against both single-threaded C (`libbz2`, `bzip2`)
-and parallel C (`lbzip2 -n 8`):
+Throughput is MB/s of plaintext out, median of five iterations. The two comparisons
+that hold thread count equal are **crabz2 serial vs libbz2** and **crabz2 parallel(8)
+vs lbzip2 -n 8**; the ratio columns give those and only those.
 
-| Input MB | crabz2 MB/s | libbz2 MB/s | bzip2 MB/s | parallel MB/s | parallel cmd | threads |
-|---:|---:|---:|---:|---:|---|---:|
-| 1 | 254.7 | 238.2 | 167.8 | 197.9 | /opt/homebrew/bin/lbzip2 | 8 |
-| 5 | 1234.4 | 334.6 | 288.6 | 771.6 | /opt/homebrew/bin/lbzip2 | 8 |
-| 10 | 1469.6 | 338.2 | 304.3 | 1022.4 | /opt/homebrew/bin/lbzip2 | 8 |
-| 50 | 2010.7 | 330.9 | 336.5 | 1755.8 | /opt/homebrew/bin/lbzip2 | 8 |
-| 100 | 2238.2 | 336.6 | 343.2 | 1956.1 | /opt/homebrew/bin/lbzip2 | 8 |
+| Input MB | crabz2 serial | libbz2 (C, 1 thread) | **serial ratio** | crabz2 par(8) | lbzip2 -n 8 (C) | **parallel ratio** | bzip2 (C, 1 thread) |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 265.1 | 242.4 | **1.09x** | 259.4 | 132.1 | **1.96x** | 184.1 |
+| 5 | 396.8 | 309.1 | **1.28x** | 1192.5 | 726.2 | **1.64x** | 280.2 |
+| 10 | 409.9 | 314.6 | **1.30x** | 1508.4 | 964.9 | **1.56x** | 288.2 |
+| 50 | 425.7 | 323.7 | **1.32x** | 2013.8 | 1758.5 | **1.15x** | 329.2 |
+| 100 | 397.9 | 328.4 | **1.21x** | 2171.3 | 1888.0 | **1.15x** | 333.1 |
+
+**Read these with three caveats.**
+
+1. **The corpus is a best case.** The script builds its plaintext by repeating the
+   44-byte sentence `the quick brown fox jumps over the lazy dog\n`. That is far more
+   redundant than real data and flatters every stage of the decoder. For throughput on
+   realistic input, use the criterion numbers in
+   [Serial decode speed vs libbz2](#serial-decode-speed-vs-libbz2) below, which is the
+   comparison to quote.
+2. **`lbzip2` and `bzip2` pay process costs that `crabz2` and `libbz2` do not.** The
+   two C binaries are timed as subprocesses reading a file and writing to a pipe;
+   `crabz2` and `libbz2` are timed in-process on a warm in-memory buffer. This inflates
+   the parallel ratio, most visibly at 1 MB, where process startup dominates and the
+   1.96x figure should be discounted accordingly.
+3. **Parallel speedup tracks block count, not input size.** At 1 MB there are only two
+   blocks to divide, which is why `crabz2 par(8)` is no faster than `crabz2 serial`
+   there.
 
 See `scripts/run_bench_multi.sh` for how the measurements were collected.
 
@@ -205,7 +231,7 @@ default feature that adds only the adapters — `Crabz2Reader<R: Read>`, `reader
 
 ```toml
 [dependencies]
-crabz2 = { version = "0.3", default-features = false }   # no_std + alloc
+crabz2 = { version = "0.6", default-features = false }   # no_std + alloc
 ```
 
 Without `std` the buffer API is `decompress_to_vec`, returning the crate's own
@@ -289,7 +315,8 @@ these numbers can drift without turning CI red.
 Speed is mixed and not yet tuned; that is what the benchmark workstream in the
 [ROADMAP](ROADMAP.md) is for. On ordinary data libbz2 compresses roughly 1.8× faster
 than crabz2; on highly repetitive input the ranking flips, because SA-IS is O(n) where
-libbz2's block sorter degrades. Decompression speed is unchanged by this work.
+libbz2's block sorter degrades. These are *encoder* figures; decode throughput is a
+separate matter, rewritten in 0.5.0 and measured below.
 
 ## Serial decode speed vs libbz2
 
@@ -302,19 +329,22 @@ PRNG, so `cargo bench` reproduces them anywhere and nothing large is checked in.
 
 | Input (10 MiB) | `bzip2 -9` ratio | crabz2 | libbz2 (C) | crabz2 vs C |
 |---|---|---|---|---|
-| English-like text | 3.8x | 56 MB/s | 57 MB/s | −2% |
-| CSV, court bulk-data shape | 6.0x | 71 MB/s | 74 MB/s | −4% |
-| Incompressible random bytes | 1.0x | 43 MB/s | 34 MB/s | +29% |
+| English-like text | 3.8x | 69.0 MiB/s | 59.2 MiB/s | **+17%** |
+| CSV, court bulk-data shape | 6.0x | 82.5 MiB/s | 72.3 MiB/s | **+14%** |
+| Incompressible random bytes | 1.0x | 35.7 MiB/s | 32.9 MiB/s | **+9%** |
 
-Figures are the best of five runs on a machine that was not otherwise idle; contention
-only ever costs throughput, and the run-to-run spread reached 10%.
+Criterion's 95% confidence intervals do not overlap on any of the three corpora
+(text `[67.8, 70.2]` vs `[58.7, 59.6]`; csv `[78.9, 85.4]` vs `[70.7, 73.6]`; random
+`[35.3, 36.2]` vs `[32.7, 33.1]`), so the margin is larger than the measurement noise.
 
-The honest summary: on compressible input the from-scratch decoder lands a couple of
-percent behind C — close enough that prose and CSV are best read as parity rather than
-a win either way — and about 30% ahead on incompressible input, where the RLE1 pass has
-nothing to expand. This is one microarchitecture (aarch64) and one compiler pair; the
-remaining difference has not been profiled and no inner-loop micro-optimization has been
-done. Multi-core numbers are in [Parallel decode](#parallel-decode) above.
+This is the comparison to quote: same thread count, same buffers, realistic corpora.
+The from-scratch decoder is 9–17% ahead of the C reference on one core — a reversal of
+the 0.4.0 result, which trailed libbz2 by 2–4% on prose and CSV. The 0.5.0 hot-path
+work is what closed and crossed that gap: write-only IBWT threading, interleaved pair
+walks, fast-table Huffman over a 64-bit bit reservoir, and an arena MTF. This is one
+microarchitecture (aarch64, Apple M-series) and one compiler pair; results on x86-64
+have not been measured. Multi-core numbers are in
+[Parallel decode](#parallel-decode) above.
 
 The benchmark also cross-validates: every corpus must decode byte-identically through
 crabz2 before it is timed.
