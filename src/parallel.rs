@@ -755,6 +755,12 @@ mod tests {
     /// pay? Each walk step is a serial dependent load, so width is memory-level
     /// parallelism. Width 2 is what `walk_pair` ships.
     /// `cargo test --release --features parallel walk_width_scaling -- --ignored --nocapture`
+    ///
+    /// Safe-build only: the comparison is between widths, so the default checked
+    /// cursor is a fine vehicle, and `unsafe-fast` swaps in a cursor stepped by
+    /// `unsafe fn step_unchecked` — duplicating the harness for it would not say
+    /// anything more about width.
+    #[cfg(not(feature = "unsafe-fast"))]
     #[test]
     #[ignore]
     fn walk_width_scaling() {
@@ -829,6 +835,7 @@ mod tests {
     }
 
     /// Experimental 4-wide interleave, mirroring `walk_pair`'s shape.
+    #[cfg(not(feature = "unsafe-fast"))]
     fn walk_quad_experiment(
         mut a: crate::WalkCursor<'_>,
         mut b: crate::WalkCursor<'_>,
