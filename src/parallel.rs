@@ -489,10 +489,12 @@ fn decode_impl(input: &[u8], min_candidates: usize) -> Result<(Vec<u8>, usize), 
     // Interleaved pair decode halves the task count, so only pair when there are
     // still several tasks per worker — otherwise (few blocks) pairing costs more
     // occupancy than the overlapped walks win back.
-    let chunk = if candidates.len() >= 4 * rayon::current_num_threads() {
-        2
-    } else {
-        1
+    let chunk = match std::env::var("CRABZ2_CHUNK").ok().and_then(|v| v.parse().ok()) {
+        // Experiment override: pin the pairing decision so the pair-walk's
+        // working-set cost can be measured against thread count.
+        Some(n @ (1 | 2)) => n,
+        _ if candidates.len() >= 4 * rayon::current_num_threads() => 2,
+        _ => 1,
     };
     let decoded: Vec<(Option<Decoded>, Option<Decoded>)> = candidates
         .par_chunks(chunk)
