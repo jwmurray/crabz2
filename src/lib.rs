@@ -237,6 +237,52 @@ fn crc_update(crc: u32, byte: u8) -> u32 {
     (crc << 8) ^ CRC_TABLE[(((crc >> 24) ^ byte as u32) & 0xff) as usize]
 }
 
+/// Slicing-by-8 tables. `CRC_TABLES[0]` is the byte-at-a-time table; each further
+/// table folds a byte forward across one more trailing zero byte.
+const CRC_TABLES: [[u32; 256]; 8] = {
+    let mut tables = [[0u32; 256]; 8];
+    tables[0] = CRC_TABLE;
+    let mut k = 1;
+    while k < 8 {
+        let mut i = 0;
+        while i < 256 {
+            let prev = tables[k - 1][i];
+            tables[k][i] = (prev << 8) ^ CRC_TABLE[(prev >> 24) as usize];
+            i += 1;
+        }
+        k += 1;
+    }
+    tables
+};
+
+/// CRC-32/BZIP2 over a whole slice, eight bytes per round.
+///
+/// The walk used to fold each byte in as it was emitted, which put a second serial
+/// dependency chain — each `crc` feeding the next — inside the hot loop, competing
+/// for out-of-order resources with the permutation's own dependent load. Worse, an
+/// RLE1 run was written with one `write_bytes` and then folded in a byte at a time.
+/// Hoisting the CRC to one pass over the finished block costs a sequential re-read,
+/// which is the one resource this decoder is not short of.
+#[inline]
+fn crc_bytes(mut crc: u32, data: &[u8]) -> u32 {
+    let mut chunks = data.chunks_exact(8);
+    for c in &mut chunks {
+        crc ^= u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+        crc = CRC_TABLES[7][(crc >> 24) as usize]
+            ^ CRC_TABLES[6][((crc >> 16) & 0xff) as usize]
+            ^ CRC_TABLES[5][((crc >> 8) & 0xff) as usize]
+            ^ CRC_TABLES[4][(crc & 0xff) as usize]
+            ^ CRC_TABLES[3][c[4] as usize]
+            ^ CRC_TABLES[2][c[5] as usize]
+            ^ CRC_TABLES[1][c[6] as usize]
+            ^ CRC_TABLES[0][c[7] as usize];
+    }
+    for &b in chunks.remainder() {
+        crc = crc_update(crc, b);
+    }
+    crc
+}
+
 /// MSB-first bit cursor over a caller-owned slice. Holds no io type and no buffer:
 /// the position is an absolute bit index, so a caller can retry a failed read after
 /// appending bytes simply by rebuilding the cursor at the last committed position.
@@ -1031,7 +1077,9 @@ struct WalkCursor<'a> {
     t_pos: u32,
     prev: i32,
     count: u32,
-    crc: u32,
+    /// Where this block's bytes begin in `out`. The CRC is taken over
+    /// `out[start..]` once the walk is finished, not folded in per byte.
+    start: usize,
     /// Steps left; one step per `tt` cell.
     rem: usize,
     out: &'a mut Vec<u8>,
@@ -1052,7 +1100,7 @@ impl<'a> WalkCursor<'a> {
             t_pos: tt[orig_ptr],
             prev: -1,
             count: 0,
-            crc: 0xFFFF_FFFF,
+            start: len,
             rem: tt.len(),
             dst: out.as_mut_ptr().wrapping_add(len),
             room: out.capacity() - len,
@@ -1085,9 +1133,6 @@ impl<'a> WalkCursor<'a> {
         if self.count == 4 {
             // `b` is the count of extra repeats beyond the four literals.
             ptr::write_bytes(self.dst, self.prev as u8, b as usize);
-            for _ in 0..b {
-                self.crc = crc_update(self.crc, self.prev as u8);
-            }
             self.dst = self.dst.add(b as usize);
             self.len += b as usize;
             self.room -= b as usize;
@@ -1098,7 +1143,6 @@ impl<'a> WalkCursor<'a> {
             self.dst = self.dst.add(1);
             self.len += 1;
             self.room -= 1;
-            self.crc = crc_update(self.crc, b);
             if b as i32 == self.prev {
                 self.count += 1;
             } else {
@@ -1125,8 +1169,8 @@ impl<'a> WalkCursor<'a> {
             self.out.set_len(self.len);
         }
         #[cfg(feature = "phasetime")]
-        _pt.lap(3); // permutation walk + RLE1 + CRC
-        !self.crc
+        _pt.lap(3); // permutation walk + RLE1
+        !crc_bytes(0xFFFF_FFFF, &self.out[self.start..self.len])
     }
 }
 
@@ -1158,7 +1202,9 @@ struct WalkCursor<'a> {
     t_pos: u32,
     prev: i32,
     count: u32,
-    crc: u32,
+    /// Where this block's bytes begin in `out`. The CRC is taken over
+    /// `out[start..]` once the walk is finished, not folded in per byte.
+    start: usize,
     /// Steps left; one step per `tt` cell.
     rem: usize,
     out: &'a mut Vec<u8>,
@@ -1167,12 +1213,13 @@ struct WalkCursor<'a> {
 #[cfg(not(feature = "unsafe-fast"))]
 impl<'a> WalkCursor<'a> {
     fn begin(tt: &'a [u32], orig_ptr: usize, out: &'a mut Vec<u8>) -> WalkCursor<'a> {
+        let start = out.len();
         WalkCursor {
             t_pos: tt[orig_ptr],
             tt,
             prev: -1,
             count: 0,
-            crc: 0xFFFF_FFFF,
+            start,
             rem: tt.len(),
             out,
         }
@@ -1187,14 +1234,10 @@ impl<'a> WalkCursor<'a> {
             // `b` is the count of extra repeats beyond the four literals.
             let v = self.prev as u8;
             self.out.resize(self.out.len() + b as usize, v);
-            for _ in 0..b {
-                self.crc = crc_update(self.crc, v);
-            }
             self.count = 0;
             self.prev = -1;
         } else {
             self.out.push(b);
-            self.crc = crc_update(self.crc, b);
             if b as i32 == self.prev {
                 self.count += 1;
             } else {
@@ -1214,8 +1257,8 @@ impl<'a> WalkCursor<'a> {
             self.rem -= 1;
         }
         #[cfg(feature = "phasetime")]
-        _pt.lap(3); // permutation walk + RLE1 + CRC
-        !self.crc
+        _pt.lap(3); // permutation walk + RLE1
+        !crc_bytes(0xFFFF_FFFF, &self.out[self.start..])
     }
 }
 
@@ -1580,6 +1623,29 @@ mod tests {
     #[cfg(feature = "std")]
     fn decodes_small_stream() {
         assert_eq!(decompress(HELLO_BZ2).unwrap(), b"hello crabz2\n");
+    }
+
+    #[test]
+    fn batched_crc_matches_byte_at_a_time() {
+        // Lengths straddling the 8-byte round: empty, every tail remainder, and
+        // sizes past several rounds.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut data = Vec::new();
+        for _ in 0..1000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            data.push((state >> 32) as u8);
+        }
+        for len in (0..40usize).chain([64, 127, 128, 129, 512, 999, 1000]) {
+            let slice = &data[..len];
+            let want = slice.iter().fold(0xFFFF_FFFFu32, |c, &b| crc_update(c, b));
+            assert_eq!(want, crc_bytes(0xFFFF_FFFF, slice), "crc mismatch at len {len}");
+        }
+        // A long run: the RLE1 shape the walk used to fold one byte at a time.
+        let run = [0xABu8; 5000];
+        let want = run.iter().fold(0xFFFF_FFFFu32, |c, &b| crc_update(c, b));
+        assert_eq!(want, crc_bytes(0xFFFF_FFFF, &run));
     }
 
     #[test]
