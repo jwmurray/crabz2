@@ -59,7 +59,7 @@ PY
   # Run the examples/compare.rs example which runs both crabz2 and libbz2.
   echo "  running cargo compare example (crabz2 vs libbz2) ..."
   COMP_OUT=$(mktemp)
-  cargo run --release --example compare --features "libbz2 parallel" -- "$BZ" $ITERS $THREADS > "$COMP_OUT" 2>&1 || (cat "$COMP_OUT" && exit 1)
+  cargo run --release --example compare --features parallel -- "$BZ" $ITERS $THREADS > "$COMP_OUT" 2>&1 || (cat "$COMP_OUT" && exit 1)
 
   # Extract MB/s from the compare example output.
   crab_mbs=$(sed -nE 's/.*crabz2 average: .*-> ([0-9.]+) MB\/s/\1/p' "$COMP_OUT" | head -n1)
@@ -69,7 +69,7 @@ PY
   # vs single-thread comparison against libbz2 above.
   echo "  running cargo compare example (crabz2 serial, threads=1) ..."
   SER_OUT=$(mktemp)
-  cargo run --release --example compare --features "libbz2 parallel" -- "$BZ" $ITERS 1 > "$SER_OUT" 2>&1 || (cat "$SER_OUT" && exit 1)
+  cargo run --release --example compare --features parallel -- "$BZ" $ITERS 1 > "$SER_OUT" 2>&1 || (cat "$SER_OUT" && exit 1)
   crab_ser_mbs=$(sed -nE 's/.*crabz2 average: .*-> ([0-9.]+) MB\/s/\1/p' "$SER_OUT" | head -n1)
   rm -f "$SER_OUT"
   if [ -z "$crab_mbs" ] || [ -z "$lib_mbs" ]; then
