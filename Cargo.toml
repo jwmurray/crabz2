@@ -33,12 +33,13 @@ version = "1.10"
 optional = true
 
 # Dev-dependencies are NOT part of the published dependency graph for consumers.
-# `anyhow` and `ureq` are used only by examples (`ureq` by `courtlistener`: pure-Rust
+# `anyhow`, `clap`, and `ureq` are used only by examples (`ureq` by `courtlistener`: pure-Rust
 # HTTPS, rustls/no C); `criterion` only by benches; `bzip2` (C libbz2 bindings) is the comparison baseline for
 # `benches/decode.rs` and `examples/compare.rs`. It is deliberately dev-only: nothing in
 # `src/` references it, so it never reaches a consumer's dependency graph.
 [dev-dependencies]
 anyhow = "1.0.100"
+clap = { version = "4.6.6", features = ["derive"] }
 ureq = { version = "3.4.0", default-features = false, features = ["rustls"] }
 criterion = { version = "0.8.2", default-features = false, features = [
     "cargo_bench_support",

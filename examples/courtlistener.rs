@@ -22,6 +22,7 @@
 //! no `libbz2` C dependency, and nothing is fully buffered — memory stays bounded to about
 //! one bzip2 block regardless of how large the download is.
 
+use clap::Parser;
 use std::io::{BufRead, BufReader};
 use std::time::Instant;
 
@@ -42,8 +43,20 @@ fn resolve(arg: Option<&str>) -> String {
     }
 }
 
+/// Stream a CourtListener bulk-data file through `crabz2` — no lbzip2, no C.
+#[derive(Parser)]
+#[command(name = "courtlistener", version, long_about = None)]
+struct Args {
+    /// What to download: a full URL, an S3 key (`bulk-data/citations-2026-06-30.csv.bz2`),
+    /// or a bare table name (`courts`, `opinions`, `citations`, ...) which is expanded
+    /// against the latest snapshot. Defaults to the small `courts` table (~80 KB).
+    #[arg(value_name = "TARGET")]
+    target: Option<String>,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let url = resolve(std::env::args().nth(1).as_deref());
+    let args = Args::parse();
+    let url = resolve(args.target.as_deref());
     eprintln!("[crabz2] GET {url}");
 
     // 1. Open the download as a streaming `Read` (pure-Rust TLS via rustls).
