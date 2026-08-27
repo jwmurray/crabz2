@@ -24,7 +24,6 @@ members = [".", "crabz2-wasm"]
 # Intentionally empty: a default build of crabz2 has no runtime dependencies. The
 # one optional dependency is declared in its own table below so this stays visibly so.
 [dependencies]
-bzip2 = { version = "0.4", optional = true }
 
 # Pulled in only by the non-default `parallel` feature. 1.10 is the last release
 # with rayon's own MSRV at 1.63, matching ours; newer minors resolve fine on newer
@@ -35,7 +34,9 @@ optional = true
 
 # Dev-dependencies are NOT part of the published dependency graph for consumers.
 # `ureq` is used only by the `courtlistener` example (pure-Rust HTTPS, rustls/no C);
-# `criterion` and `bzip2` (C libbz2 bindings — the benchmark baseline) only by benches.
+# `criterion` only by benches; `bzip2` (C libbz2 bindings) is the comparison baseline for
+# `benches/decode.rs` and `examples/compare.rs`. It is deliberately dev-only: nothing in
+# `src/` references it, so it never reaches a consumer's dependency graph.
 [dev-dependencies]
 ureq = { version = "2", default-features = false, features = ["tls"] }
 criterion = { version = "0.5", default-features = false, features = [
@@ -62,9 +63,6 @@ std = []
 # default — with it off the serial decoder compiles exactly as it does today.
 parallel = ["dep:rayon", "std"]
 
-# Optional C-backed libbz2 baseline used by the `examples/compare.rs` example.
-libbz2 = ["bzip2"]
-
 # Dev-only: per-phase timers inside `decode_block` (Phase A profiling). Never default.
 phasetime = ["std"]
 
@@ -90,4 +88,4 @@ required-features = ["parallel"]
 
 [[example]]
 name = "compare"
-required-features = ["libbz2", "parallel"]
+required-features = ["parallel"]

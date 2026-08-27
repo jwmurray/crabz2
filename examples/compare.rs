@@ -3,7 +3,7 @@
 //!
 //! Usage:
 //! ```text
-//! cargo run --release --example compare --features libbz2 -- corpus.csv.bz2 [iters] [threads]
+//! cargo run --release --example compare --features parallel -- corpus.csv.bz2 [iters] [threads]
 //! ```
 //! - `iters` defaults to 5. `threads` is optional and passed to `crabz2::decompress_parallel`.
 use std::error::Error;
