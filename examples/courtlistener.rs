@@ -47,8 +47,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[crabz2] GET {url}");
 
     // 1. Open the download as a streaming `Read` (pure-Rust TLS via rustls).
-    let response = ureq::get(&url).call()?;
-    let compressed = response.into_reader();
+    let mut response = ureq::get(&url).call()?;
+    let compressed = response.body_mut().as_reader();
 
     // 2. Decompress in-process. This single line is what replaces the `lbzip2 -dc`
     //    child process the ingester would otherwise spawn.

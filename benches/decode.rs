@@ -10,10 +10,16 @@
 //! criterion's test mode; it then uses 1 MiB corpora so the compile/correctness check
 //! stays fast.
 
+// The crate's MSRV is 1.63, but this target cannot honour it regardless: criterion 0.8
+// requires 1.86. `std::hint::black_box` (stable since 1.66) is therefore fine here, and
+// is what criterion 0.8 deprecates its own re-export in favour of.
+#![allow(clippy::incompatible_msrv)]
+
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
 
 /// Corpus size for a real benchmark run.
 const BENCH_BYTES: usize = 10 * 1024 * 1024;

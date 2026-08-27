@@ -33,16 +33,21 @@ version = "1.10"
 optional = true
 
 # Dev-dependencies are NOT part of the published dependency graph for consumers.
-# `ureq` is used only by the `courtlistener` example (pure-Rust HTTPS, rustls/no C);
-# `criterion` only by benches; `bzip2` (C libbz2 bindings) is the comparison baseline for
+# `anyhow` and `ureq` are used only by examples (`ureq` by `courtlistener`: pure-Rust
+# HTTPS, rustls/no C); `criterion` only by benches; `bzip2` (C libbz2 bindings) is the comparison baseline for
 # `benches/decode.rs` and `examples/compare.rs`. It is deliberately dev-only: nothing in
 # `src/` references it, so it never reaches a consumer's dependency graph.
 [dev-dependencies]
-ureq = { version = "2", default-features = false, features = ["tls"] }
-criterion = { version = "0.5", default-features = false, features = [
+anyhow = "1.0.100"
+ureq = { version = "3.4.0", default-features = false, features = ["rustls"] }
+criterion = { version = "0.8.2", default-features = false, features = [
     "cargo_bench_support",
 ] }
-bzip2 = "0.4"
+# `default-features = false` + `bzip2-sys` is load-bearing: bzip2 0.6's default backend
+# is `libbz2-rs-sys`, a pure-Rust *port* of libbz2. The entire purpose of this dependency
+# is to be the **C** libbz2 baseline the README's numbers are measured against, so the C
+# backend is selected explicitly. Dropping these two keys silently changes what we compare to.
+bzip2 = { version = "0.6.1", default-features = false, features = ["bzip2-sys"] }
 
 # `test = true` makes `cargo test` build and smoke-run the bench binary (criterion's
 # test mode: one iteration each), so the benchmarks cannot rot unnoticed in CI.
